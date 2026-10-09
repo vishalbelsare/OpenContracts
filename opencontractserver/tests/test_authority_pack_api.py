@@ -13,11 +13,11 @@ from django.contrib.auth import get_user_model
 from django.core.management.base import CommandError
 from django.db import IntegrityError
 from django.test import TestCase
-from graphql_relay import to_global_id
 
 from config.graphql.schema import schema
 from opencontractserver.annotations.models import (
     AuthorityNamespace,
+    AuthorityPackActivation,
     AuthorityRelationship,
 )
 from opencontractserver.corpuses.models import Corpus
@@ -28,6 +28,7 @@ from opencontractserver.enrichment.services.authority_pack_service import (
     AuthorityPackService,
 )
 from opencontractserver.enrichment.services.authority_permissions import DENIED
+from opencontractserver.utils.ids import to_global_id
 
 User = get_user_model()
 
@@ -350,11 +351,14 @@ class AuthorityPackAPITests(TestCase):
         calls: list[int] = []
 
         def flaky_preflight(cls, pack_dir, *, creator):
-            # ``install`` preflights twice: once to build the plan it validates
-            # the fingerprint against, once afterwards to re-read the installed
-            # state. Only the second — the post-commit one — fails here.
-            calls.append(1)
-            if len(calls) > 1:
+            # Only the response refresh runs after the active pointer commits;
+            # snapshot validation and the locked preflight must still succeed.
+            if (
+                Path(pack_dir) == self.pack_dir
+                and AuthorityPackActivation.objects.filter(
+                    pack_id="portable_test_pack", active_artifact__isnull=False
+                ).exists()
+            ):
                 raise CommandError("pack vanished mid-install")
             return real_preflight(cls, pack_dir, creator=creator)
 
@@ -372,7 +376,6 @@ class AuthorityPackAPITests(TestCase):
                     expected_fingerprint=preflight.fingerprint,
                     relink=False,
                 )
-
         self.assertTrue(result.ok, result.error)
         self.assertTrue(
             Corpus.objects.filter(
@@ -408,6 +411,11 @@ class AuthorityPackAPITests(TestCase):
                     expected_fingerprint=preflight.fingerprint,
                     relink=False,
                 )
+                assert preflight.pack_dir is not None
+                with self.assertRaisesMessage(CommandError, CONCURRENT_INSTALL_MESSAGE):
+                    AuthorityPackService.install_path(
+                        preflight.pack_dir, creator=self.admin, relink=False
+                    )
 
         self.assertFalse(result.ok)
         self.assertEqual(result.error, CONCURRENT_INSTALL_MESSAGE)

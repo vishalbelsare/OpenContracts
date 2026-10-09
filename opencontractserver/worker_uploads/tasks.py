@@ -16,23 +16,21 @@ import logging
 import re
 from datetime import timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from celery import shared_task
 from django.conf import settings
 from django.core.files.base import ContentFile, File
 from django.db import transaction
+from django.db.models import F, Q
 from django.utils import timezone
 
-from opencontractserver.annotations.models import (
-    EMBEDDING_DIMENSIONS,
-    Annotation,
-    AnnotationLabel,
-    Embedding,
-)
+from opencontractserver.annotations.models import Annotation, AnnotationLabel, Embedding
 from opencontractserver.constants.document_processing import (
+    MAX_PROCESSING_ATTEMPTS,
     MAX_UPLOAD_ERROR_MESSAGE_LENGTH,
 )
+from opencontractserver.constants.search import DIM_TO_FIELD_MAP
 from opencontractserver.corpuses.models import CorpusFolder
 from opencontractserver.documents.models import (
     Document,
@@ -51,26 +49,17 @@ from opencontractserver.utils.permissioning import set_permissions_for_obj_to_us
 from opencontractserver.utils.structural_sets import create_structural_annotation_set
 from opencontractserver.utils.subtree_groups import build_subtree_groups_for_document
 from opencontractserver.worker_uploads.models import (
+    CorpusAccessToken,
     UploadStatus,
     WorkerAuthoritySectionBatch,
     WorkerDocumentUpload,
 )
+from opencontractserver.worker_uploads.upload_recovery import record_failure
 
 logger = logging.getLogger(__name__)
 
 # Maximum length for sanitized filenames
 _MAX_FILENAME_LENGTH = 200
-
-# Dimension -> field name mapping, derived from the Embedding model's
-# authoritative EMBEDDING_DIMENSIONS list so new dimensions propagate automatically.
-_VECTOR_FIELD_MAP = {dim: f"vector_{dim}" for dim, _ in EMBEDDING_DIMENSIONS}
-
-# Validate that every entry in _VECTOR_FIELD_MAP corresponds to an actual
-# Embedding model field. Catches dimension/field mismatches at import time
-# rather than silently dropping embeddings at runtime.
-assert all(
-    hasattr(Embedding, f) for f in _VECTOR_FIELD_MAP.values()
-), "EMBEDDING_DIMENSIONS has entries without matching Embedding model fields"
 
 
 @shared_task(
@@ -94,12 +83,16 @@ def process_pending_uploads(self: Any) -> dict[str, int]:
         Summary dict with counts of processed, succeeded, and failed.
     """
     result = {"claimed": 0, "succeeded": 0, "failed": 0}
+    processing_token = uuid4()
 
     # Claim a batch of PENDING uploads atomically
     with transaction.atomic():
         pending_ids = list(
-            WorkerDocumentUpload.objects.select_for_update(skip_locked=True)
+            WorkerDocumentUpload.objects.select_for_update(
+                skip_locked=True, of=("self",)
+            )
             .filter(status=UploadStatus.PENDING)
+            .filter(Q(ingestion_run__isnull=True) | Q(ingestion_run__status="ACTIVE"))
             .order_by("created")
             .values_list("id", flat=True)[: settings.WORKER_UPLOAD_BATCH_SIZE]
         )
@@ -112,6 +105,8 @@ def process_pending_uploads(self: Any) -> dict[str, int]:
         WorkerDocumentUpload.objects.filter(id__in=pending_ids).update(
             status=UploadStatus.PROCESSING,
             processing_started=timezone.now(),
+            processing_token=processing_token,
+            processing_attempts=F("processing_attempts") + 1,
         )
 
     result["claimed"] = len(pending_ids)
@@ -120,20 +115,24 @@ def process_pending_uploads(self: Any) -> dict[str, int]:
     # Process each upload in its own transaction for isolation
     for upload_id in pending_ids:
         try:
-            _process_single_upload(upload_id)
-            result["succeeded"] += 1
+            if _process_single_upload(upload_id, processing_token):
+                result["succeeded"] += 1
         except Exception as e:
             logger.error(
                 f"process_pending_uploads: upload {upload_id} failed: {e}",
                 exc_info=True,
             )
-            _fail_upload(upload_id, str(e)[:MAX_UPLOAD_ERROR_MESSAGE_LENGTH])
+            _fail_upload(
+                upload_id, str(e)[:MAX_UPLOAD_ERROR_MESSAGE_LENGTH], processing_token
+            )
             result["failed"] += 1
 
     # Re-enqueue if there are more pending uploads
-    remaining = WorkerDocumentUpload.objects.filter(
-        status=UploadStatus.PENDING
-    ).exists()
+    remaining = (
+        WorkerDocumentUpload.objects.filter(status=UploadStatus.PENDING)
+        .filter(Q(ingestion_run__isnull=True) | Q(ingestion_run__status="ACTIVE"))
+        .exists()
+    )
     if remaining:
         process_pending_uploads.apply_async(
             queue="worker_uploads",
@@ -166,21 +165,45 @@ def recover_stalled_uploads() -> dict[str, int]:
                 status=UploadStatus.PROCESSING,
                 processing_started__lt=cutoff,
             )
-            .values_list("id", "processing_started")
+            .values_list("id", "processing_started")[
+                : settings.WORKER_UPLOAD_BATCH_SIZE
+            ]
         )
 
         for upload_id, original_started in stalled:
             # Compare-and-swap: only reset if processing_started hasn't changed
             # since we read it, preventing double-processing races.
-            updated = WorkerDocumentUpload.objects.filter(
+            upload = WorkerDocumentUpload.objects.filter(
                 id=upload_id,
                 status=UploadStatus.PROCESSING,
                 processing_started=original_started,
-            ).update(
-                status=UploadStatus.PENDING,
-                processing_started=None,
-            )
-            count += updated
+            ).first()
+            if upload:
+                record_failure(upload, "processing_abandoned")
+                upload.status = (
+                    UploadStatus.FAILED
+                    if upload.processing_attempts >= MAX_PROCESSING_ATTEMPTS
+                    else UploadStatus.PENDING
+                )
+                upload.processing_token = None
+                upload.processing_started = None
+                upload.processing_finished = (
+                    timezone.now() if upload.status == UploadStatus.FAILED else None
+                )
+                upload.save(
+                    update_fields=[
+                        "status",
+                        "processing_token",
+                        "processing_started",
+                        "error_message",
+                        "error_history",
+                        "processing_finished",
+                    ]
+                )
+                if upload.status == UploadStatus.FAILED:
+                    # Terminal: nothing will read the staged source again.
+                    _delete_staging_file(upload)
+                count += 1
 
     # Same sweep for authority-section batches, same compare-and-swap.
     batch_count = 0
@@ -214,7 +237,45 @@ def recover_stalled_uploads() -> dict[str, int]:
     return {"recovered": count, "recovered_section_batches": batch_count}
 
 
-def _process_single_upload(upload_id: UUID) -> None:
+def _require_staged_worker_token(
+    token: CorpusAccessToken | None,
+    corpus_id: int,
+    *,
+    authority_sections: bool = False,
+) -> CorpusAccessToken:
+    """Return a live token for the staged corpus and requested capability.
+
+    Callers load the token, worker account and linked user afresh. This check
+    performs no writes and promises no cancellation after execution begins.
+    Corpus-creator attribution is a separate caller responsibility.
+    """
+    if token is None:
+        raise ValueError(
+            "Corpus access token was deleted before this batch drained; "
+            "re-push under a live token."
+        )
+    if not token.is_valid:
+        raise ValueError(
+            "Corpus access token was revoked or expired before this "
+            "batch drained; re-push under a live token."
+        )
+    if token.corpus_id != corpus_id:
+        raise ValueError(
+            "Corpus access token no longer grants access to the staged corpus."
+        )
+    if authority_sections and not token.can_push_authority_sections:
+        raise ValueError(
+            "Corpus access token no longer carries the "
+            "authority-section push capability; re-push under a token "
+            "minted with --allow-authority-sections."
+        )
+    return token
+
+
+@transaction.atomic
+def _process_single_upload(
+    upload_id: UUID, processing_token: UUID | None = None
+) -> bool:
     """
     Process one WorkerDocumentUpload: create Document, annotations,
     embeddings, and add to the target corpus.
@@ -222,12 +283,52 @@ def _process_single_upload(upload_id: UUID) -> None:
     Runs inside its own transaction. On success, marks COMPLETED.
     On failure, the caller catches the exception and marks FAILED.
     """
-    upload = WorkerDocumentUpload.objects.select_related(
-        "corpus",
-        "corpus__creator",
-        "corpus_access_token",
-        "corpus_access_token__worker_account",
-    ).get(id=upload_id)
+    upload = (
+        WorkerDocumentUpload.objects.select_for_update(of=("self",))
+        .select_related(
+            "corpus",
+            "corpus__creator",
+            "corpus_access_token",
+            "corpus_access_token__worker_account__user",
+        )
+        .get(id=upload_id)
+    )
+    if upload.status != UploadStatus.PROCESSING or (
+        processing_token is not None and upload.processing_token != processing_token
+    ):
+        return False
+    _require_staged_worker_token(upload.corpus_access_token, upload.corpus_id)
+
+    if upload.ingestion_run_id:
+        from opencontractserver.worker_uploads.run_models import IngestionRun
+        from opencontractserver.worker_uploads.run_policy import (
+            RunPolicyError,
+            validate_preparation,
+        )
+        from opencontractserver.worker_uploads.run_services import _violate_locked
+
+        run = IngestionRun.objects.select_for_update().get(pk=upload.ingestion_run_id)
+        try:
+            if run.status != IngestionRun.Status.ACTIVE:
+                raise RunPolicyError("run_not_active")
+            validate_preparation(run, upload.metadata)
+        except RunPolicyError as exc:
+            code = exc.public_code
+            if code != "run_not_active":
+                _violate_locked(run, code)
+            upload.status = UploadStatus.PENDING
+            upload.processing_token = None
+            upload.processing_started = None
+            upload.processing_attempts = max(0, upload.processing_attempts - 1)
+            upload.save(
+                update_fields=[
+                    "status",
+                    "processing_token",
+                    "processing_started",
+                    "processing_attempts",
+                ]
+            )
+            return False
 
     metadata = upload.metadata
     corpus = upload.corpus
@@ -269,7 +370,12 @@ def _process_single_upload(upload_id: UUID) -> None:
             doc_filename.strip().lstrip(".")[:_MAX_FILENAME_LENGTH] or "document"
         )
         if "." not in doc_filename:
-            doc_filename += ".pdf"
+            from opencontractserver.pipeline.base.file_types import FileTypeEnum
+
+            file_type = FileTypeEnum.from_mimetype(
+                metadata.get("file_type", "application/pdf")
+            )
+            doc_filename += f".{file_type.value if file_type else 'pdf'}"
 
         pawls_content = metadata.get("pawls_file_content", [])
         text_content = metadata.get("content", "")
@@ -290,6 +396,7 @@ def _process_single_upload(upload_id: UUID) -> None:
         custom_meta = metadata.get("custom_meta")
 
         create_kwargs: dict[str, Any] = {
+            "ingestion_run_id": upload.ingestion_run_id,
             "title": safe_title,
             "description": metadata.get("description", ""),
             "pdf_file": File(upload.file, doc_filename),
@@ -302,6 +409,7 @@ def _process_single_upload(upload_id: UUID) -> None:
             # Mark as already processed — worker did the processing
             "processing_started": timezone.now(),
             "processing_status": DocumentProcessingStatus.COMPLETED,
+            "processing_finished": timezone.now(),
         }
         if custom_meta is not None:
             create_kwargs["custom_meta"] = custom_meta
@@ -362,7 +470,11 @@ def _process_single_upload(upload_id: UUID) -> None:
             corpus_obj=corpus,
             annotations_data=metadata.get("labelled_text", []),
             label_lookup=label_lookup,
-            dispatch_embeddings=not bool(embeddings_data),
+            label_type=settings.ANNOTATION_LABELS.get(
+                corpus_doc.file_type, "SPAN_LABEL"
+            ),
+            dispatch_embeddings=not bool(embeddings_data)
+            and not upload.ingestion_run_id,
         )
 
         # 6. Import relationships
@@ -430,9 +542,26 @@ def _process_single_upload(upload_id: UUID) -> None:
 
         # 10. Mark upload as completed and clean up staging file
         upload.status = UploadStatus.COMPLETED
+        upload.error_message = ""
         upload.result_document = corpus_doc
         upload.processing_finished = timezone.now()
-        upload.save(update_fields=["status", "result_document", "processing_finished"])
+        upload.save(
+            update_fields=[
+                "status",
+                "result_document",
+                "processing_finished",
+                "error_message",
+            ]
+        )
+
+    if upload.ingestion_run_id:
+        from opencontractserver.worker_uploads.run_services import (
+            queue_document_operations,
+        )
+
+        # Persist downstream operations in the upload transaction. A process
+        # crash after commit must not lose admission; only broker nudges defer.
+        queue_document_operations(corpus_doc.pk)
 
     # Generate the document thumbnail after commit. The worker-upload metadata
     # carries no thumbnail, but the source file IS stored, so the server can
@@ -440,30 +569,32 @@ def _process_single_upload(upload_id: UUID) -> None:
     # standalone task (NOT the ingest chain), so it only thumbnails — it never
     # re-parses the already-processed document. Dispatched post-commit so the
     # row is visible to the worker.
+    def after_commit():
+        _delete_staging_file(upload)
+        _dispatch_thumbnail(upload_id, corpus_doc.id)
+
+    transaction.on_commit(after_commit)
+    logger.info(
+        f"Worker upload {upload_id} processed: doc={corpus_doc.id} "
+        f"in corpus={corpus.id}"
+    )
+    return True
+
+
+def _dispatch_thumbnail(upload_id, document_id):
+    from opencontractserver.worker_uploads.run_services import suppress_stage
+
+    if suppress_stage(document_id, "thumbnail"):
+        return
     try:
         from opencontractserver.tasks.doc_tasks import extract_thumbnail
 
-        extract_thumbnail.apply_async(kwargs={"doc_id": corpus_doc.id})
+        extract_thumbnail.apply_async(kwargs={"doc_id": document_id})
     except Exception:
         logger.warning(
             f"Failed to dispatch thumbnail generation for upload {upload_id}",
             exc_info=True,
         )
-
-    # Clean up staging file after successful commit
-    if upload.file:
-        try:
-            upload.file.delete(save=False)
-        except Exception:
-            logger.warning(
-                f"Failed to delete staging file for upload {upload_id}",
-                exc_info=True,
-            )
-
-    logger.info(
-        f"Worker upload {upload_id} processed: doc={corpus_doc.id} "
-        f"in corpus={corpus.id}"
-    )
 
 
 def _prepare_labels(
@@ -475,7 +606,13 @@ def _prepare_labels(
     Load or create text and document labels from the upload metadata.
     Returns (label_lookup, doc_label_lookup).
     """
-    text_labels = metadata.get("text_labels", {})
+    fallback = settings.ANNOTATION_LABELS.get(
+        metadata.get("file_type", "application/pdf"), "SPAN_LABEL"
+    )
+    text_labels = {
+        name: {**definition, "label_type": definition.get("label_type") or fallback}
+        for name, definition in metadata.get("text_labels", {}).items()
+    }
     doc_labels_defs = metadata.get("doc_labels_definitions", {})
 
     existing_text = load_or_create_labels(
@@ -517,15 +654,41 @@ def _store_embeddings(
         logger.warning("embeddings.embedder_path is empty, skipping embedding storage.")
         return
 
-    # Document embedding
+    # A worker's model revision must match an operator-configured revision.
+    # Legacy/unidentified vectors remain usable by existing search, but cannot
+    # establish readiness until their provenance is verified or repaired.
+    configuration = ""
+    revision = getattr(settings, "EMBEDDING_MODEL_REVISIONS", {}).get(embedder_path)
+    if revision and embeddings_data.get("model_identity") == revision:
+        from opencontractserver.documents.readiness import effective_embedder
+
+        try:
+            path, _dimension, fingerprint = effective_embedder(path=embedder_path)
+            if path == embedder_path:
+                configuration = fingerprint
+        except Exception:
+            # Provenance is optional for receipt completion. Keep the vectors
+            # unverified when the server cannot assess their configuration.
+            logger.warning("Worker embedding provenance unavailable", exc_info=True)
+
+    # Document embedding. Go through the manager so a re-upload at a new
+    # dimension clears the stale sibling vector instead of leaving two
+    # vectors labelled with one configuration.
     doc_embedding = embeddings_data.get("document_embedding")
     if doc_embedding:
-        _store_single_embedding(
-            vector=doc_embedding,
-            embedder_path=embedder_path,
-            document=corpus_doc,
-            creator=user,
-        )
+        if len(doc_embedding) in DIM_TO_FIELD_MAP:
+            Embedding.objects.store_embedding(
+                creator=user,
+                dimension=len(doc_embedding),
+                vector=doc_embedding,
+                embedder_path=embedder_path,
+                configuration=configuration,
+                document_id=corpus_doc.pk,
+            )
+        else:
+            logger.warning(
+                f"Unsupported embedding dimension {len(doc_embedding)}, skipping."
+            )
 
     # Annotation embeddings
     annot_embeddings = embeddings_data.get("annotation_embeddings", {})
@@ -542,7 +705,7 @@ def _store_embeddings(
             )
             continue
 
-        field_name = _get_vector_field(len(vector))
+        field_name = DIM_TO_FIELD_MAP.get(len(vector))
         if not field_name:
             logger.warning(
                 f"Unsupported embedding dimension {len(vector)} for annotation "
@@ -553,6 +716,7 @@ def _store_embeddings(
         emb = Embedding(
             annotation_id=new_pk,
             embedder_path=embedder_path,
+            configuration=configuration,
             creator_id=user.id,
         )
         setattr(emb, field_name, vector)
@@ -566,54 +730,49 @@ def _store_embeddings(
         )
 
 
-def _store_single_embedding(
-    vector: list[float],
-    embedder_path: str,
-    document: Any = None,
-    annotation: Any = None,
-    creator: Any = None,
-) -> Embedding | None:
-    """Store a single embedding, determining the correct vector field by dimension."""
-    field_name = _get_vector_field(len(vector))
-    if not field_name:
-        logger.warning(f"Unsupported embedding dimension {len(vector)}, skipping.")
-        return None
-
-    defaults = {field_name: vector}
-    if creator is not None:
-        defaults["creator"] = creator
-
-    # Use update_or_create to handle duplicates gracefully
-    emb, created = Embedding.objects.update_or_create(
-        embedder_path=embedder_path,
-        document=document,
-        annotation=annotation,
-        defaults=defaults,
-    )
-    return emb
-
-
-def _get_vector_field(dimension: int) -> str | None:
-    """Map an embedding dimension to the corresponding Embedding model field."""
-    return _VECTOR_FIELD_MAP.get(dimension)
-
-
-def _fail_upload(upload_id: UUID, error_message: str) -> None:
+@transaction.atomic
+def _fail_upload(
+    upload_id: UUID, error_message: str, processing_token: UUID | None = None
+) -> None:
     """Mark an upload as FAILED and clean up its staging file."""
-    upload = WorkerDocumentUpload.objects.filter(id=upload_id).first()
-    if upload is None:
+    upload = (
+        WorkerDocumentUpload.objects.select_for_update().filter(id=upload_id).first()
+    )
+    if (
+        upload is None
+        or upload.status == UploadStatus.COMPLETED
+        or (
+            processing_token is not None and upload.processing_token != processing_token
+        )
+    ):
         return
     upload.status = UploadStatus.FAILED
-    upload.error_message = error_message
+    record_failure(upload, error_message)
     upload.processing_finished = timezone.now()
-    upload.save(update_fields=["status", "error_message", "processing_finished"])
+    upload.save(
+        update_fields=[
+            "status",
+            "error_message",
+            "error_history",
+            "processing_finished",
+        ]
+    )
+
+    # Keyed receipts can be retried with the same prepared source, so keep it
+    # until the attempts are exhausted and the receipt is terminal. Requests
+    # that did not opt into idempotency keep the legacy cleanup contract.
+    if not upload.client_key or upload.processing_attempts >= MAX_PROCESSING_ATTEMPTS:
+        _delete_staging_file(upload)
+
+
+def _delete_staging_file(upload):
 
     if upload.file:
         try:
             upload.file.delete(save=False)
         except Exception:
             logger.warning(
-                f"Failed to delete staging file for upload {upload_id}",
+                f"Failed to delete staging file for upload {upload.pk}",
                 exc_info=True,
             )
 
@@ -711,7 +870,7 @@ def process_pending_section_batches(self: Any) -> dict[str, int]:
                     skip_locked=True, of=("self",)
                 )
                 .select_related(
-                    "corpus_access_token__worker_account", "corpus__creator"
+                    "corpus_access_token__worker_account__user", "corpus__creator"
                 )
                 .filter(status=UploadStatus.PENDING)
                 .order_by("created")
@@ -724,34 +883,9 @@ def process_pending_section_batches(self: Any) -> dict[str, int]:
             batch.save(update_fields=["status", "processing_started"])
         claimed += 1
         try:
-            token = batch.corpus_access_token
-            if token is None:
-                raise ValueError(
-                    "Corpus access token was deleted before this batch drained; "
-                    "re-push under a live token."
-                )
-            # Re-validate the token AT DRAIN TIME, not only at push time.
-            # Revoking a token (the normal soft-deactivate path) is how an
-            # operator stops a misbehaving harvester, and authority-section
-            # push has a strictly larger blast radius than document upload —
-            # it creates/versions documents and relinks every citing corpus.
-            # Letting already-staged batches execute past revocation would
-            # make the revocation ineffective for exactly the operation that
-            # most needs it. ``is_valid`` is the same predicate
-            # WorkerTokenAuthentication enforces on the push path (token
-            # active, account active, not expired); worker_account is
-            # select_related above, so this costs no extra query.
-            if not token.is_valid:
-                raise ValueError(
-                    "Corpus access token was revoked or expired before this "
-                    "batch drained; re-push under a live token."
-                )
-            if not token.can_push_authority_sections:
-                raise ValueError(
-                    "Corpus access token no longer carries the "
-                    "authority-section push capability; re-push under a token "
-                    "minted with --allow-authority-sections."
-                )
+            token = _require_staged_worker_token(
+                batch.corpus_access_token, batch.corpus_id, authority_sections=True
+            )
             creator = batch.corpus.creator
             if creator is None or not creator.is_active:
                 raise ValueError(
@@ -817,3 +951,10 @@ def process_pending_section_batches(self: Any) -> dict[str, int]:
             ignore_result=True,
         )
     return processed
+
+
+# Register the reservation tasks with Celery's standard app autodiscovery.
+from .run_tasks import (  # noqa: E402,F401
+    process_ingestion_operation,
+    process_pending_ingestion_operations,
+)

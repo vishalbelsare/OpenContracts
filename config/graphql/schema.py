@@ -33,6 +33,7 @@ from config.graphql import (
     authority_namespace_mutations as _authority_namespace_mutations,
 )
 from config.graphql import authority_pack_api as _authority_pack_api
+from config.graphql import automation_credential_api as _automation_credential_api
 from config.graphql import badge_mutations as _badge_mutations
 from config.graphql import base_types as _base_types
 from config.graphql import conversation_mutations as _conversation_mutations
@@ -83,6 +84,7 @@ from config.graphql import voting_mutations as _voting_mutations
 from config.graphql import worker_mutations as _worker_mutations
 from config.graphql import worker_queries as _worker_queries
 from config.graphql import worker_types as _worker_types
+from config.graphql.automation import AutomationScopeExtension
 from config.graphql.security import DepthLimitValidationRule, DisableIntrospection
 
 _query_ns: dict[str, Any] = {}
@@ -90,6 +92,7 @@ _query_ns.update(_action_queries.QUERY_FIELDS)
 _query_ns.update(_annotation_queries.QUERY_FIELDS)
 _query_ns.update(_annotation_types.QUERY_FIELDS)
 _query_ns.update(_authority_pack_api.QUERY_FIELDS)
+_query_ns.update(_automation_credential_api.QUERY_FIELDS)
 _query_ns.update(_conversation_queries.QUERY_FIELDS)
 _query_ns.update(_conversation_types.QUERY_FIELDS)
 _query_ns.update(_corpus_queries.QUERY_FIELDS)
@@ -115,6 +118,7 @@ _mutation_ns.update(_authority_frontier_mutations.MUTATION_FIELDS)
 _mutation_ns.update(_authority_mapping_mutations.MUTATION_FIELDS)
 _mutation_ns.update(_authority_namespace_mutations.MUTATION_FIELDS)
 _mutation_ns.update(_authority_pack_api.MUTATION_FIELDS)
+_mutation_ns.update(_automation_credential_api.MUTATION_FIELDS)
 _mutation_ns.update(_badge_mutations.MUTATION_FIELDS)
 _mutation_ns.update(_conversation_mutations.MUTATION_FIELDS)
 _mutation_ns.update(_corpus_category_mutations.MUTATION_FIELDS)
@@ -201,7 +205,12 @@ _custom_rules: list = [DepthLimitValidationRule]
 if not settings.DEBUG:
     _custom_rules.append(DisableIntrospection)
 
-_extensions: list = [AddValidationRules(_custom_rules)]
+# Strawberry binds execution_context on each extension. Construct it per
+# request so overlapping operations never share validation state.
+_extensions: list = [
+    lambda: AddValidationRules(_custom_rules),
+    AutomationScopeExtension,
+]
 if getattr(settings, "FILE_URL_SHARED_CACHE_TTL", 0):
     from config.graphql.file_url_prewarm import FileUrlPrewarmExtension
 
@@ -216,11 +225,3 @@ schema = strawberry.Schema(
     types=_extra_types,
     extensions=_extensions,
 )
-
-# Backwards-compatibility accessor: graphene's ``Schema`` exposed the
-# underlying graphql-core schema as ``.graphql_schema``. A few call sites
-# (frontend-document validation in ``scripts/validate_frontend_graphql.py``
-# and ``test_security_hardening``/``test_authority_mapping_loader``) reach
-# for it directly. Strawberry stores it on the private ``_schema``; alias it
-# so those references keep working across the migration without a rename.
-schema.graphql_schema = schema._schema  # type: ignore[attr-defined]

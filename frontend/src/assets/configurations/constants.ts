@@ -1,8 +1,7 @@
 import { OS_LEGAL_COLORS } from "./osLegalStyles";
 
-// Rendered in the NavBar version pill. v3.0.0.rc1 ships the cite rebrand
-// as a release candidate; the GA cut will drop the suffix.
-export const VERSION_TAG = "v3.0.0.rc1";
+// Rendered in the NavBar version pill. Keep in sync with the release tag.
+export const VERSION_TAG = "v3.1.1";
 // Small-mobile breakpoint - used by chat widget styles for the tightest
 // viewports (very small phones), where chat-bubble arrows are removed and
 // font sizes shrink. Distinct from MOBILE_VIEW_BREAKPOINT (600).
@@ -1185,3 +1184,7 @@ export const GOVERNANCE_GRAPH_WEAVING_MAX_MS = 90000;
 /** Max authority rows shown in the wanted-authorities backlog card; the
  * server already ranks by mention volume, so the cut keeps the top demand. */
 export const WANTED_AUTHORITIES_MAX_ROWS = 5;
+
+// Defaults for the automation credential mint form.
+export const AUTOMATION_CREDENTIAL_DEFAULT_DAYS = 30;
+export const AUTOMATION_CREDENTIAL_NAME_MAX_LENGTH = 100;

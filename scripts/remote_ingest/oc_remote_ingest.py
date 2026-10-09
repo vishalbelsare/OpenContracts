@@ -1,69 +1,13 @@
 #!/usr/bin/env python3
-"""
-oc_remote_ingest.py — run the OpenContracts ingestion pipeline on a remote host
-and stream FAITHFUL, fully-processed documents into a target OpenContracts
-corpus via the worker-upload REST API.
+"""Parse PDF, DOCX and TXT files remotely and upload prepared artifacts.
 
-WHY THIS EXISTS
----------------
-``scripts/bulk_import/oc_bulk_import.py`` ships *raw* PDFs to the server and lets
-the SERVER parse them (Docling + embeddings). That offloads nothing — the
-expensive work still runs in-cluster. This driver instead does the heavy lifting
-(Docling parse + embedding) on a beefy *remote* worker and ships the finished
-artifacts — PAWLs token layer, text layer, structural annotations, relationships
-and pre-computed embeddings — to the target via ``POST /api/worker-uploads/
-documents/``, which bypasses the server parser entirely. The result is a faithful
-mirror: because the worker runs the SAME Docling microservice and the SAME
-``DoclingParser`` code the server would run, the PAWLs and structural layer are
-identical to an in-cluster ingestion (no tokenizer drift).
+Reuses the application's parser implementations with worker-local settings and
+no target database access. PDF text is reconstructed from PAWLS; DOCX/TXT retain
+parser character spans. Local enrichers run before embedding and worker-upload.
 
-FAITHFUL-BY-CONSTRUCTION
-------------------------
-* PAWLs / structural annotations / relationships: produced by the real
-  ``DoclingParser.parse_pdf_bytes`` (same parser, same docling service).
-* Text layer (``content``): rebuilt from the shipped PAWLs with the same
-  ``plasmapdf.build_translation_layer`` the server's ``save_parsed_data`` uses,
-  so the stored text layer matches byte-for-byte.
-* Embeddings: computed against the same vector-embedder microservice the server
-  uses, over the same inputs (full text for the doc, ``rawText`` per annotation).
-* Structural set + thumbnail: materialised server-side by the worker-upload
-  ingestion path (see opencontractserver/worker_uploads/tasks.py).
-
-DESIGN
-------
-* Resumable: a SQLite ledger records every document's state (PENDING / UPLOADED /
-  COMPLETED / FAILED / PARKED). Re-running ``run`` skips finished work. Each doc
-  is keyed by its path relative to ``--root-dir`` (its corpus folder path).
-* Per-document streaming (NO archive): scales to 100k–1M docs without ever
-  building a ZIP. The slow step is the remote Docling parse, so the driver runs
-  a thread pool of workers and paces itself against the server's worker-upload
-  backlog (the ``documents/list/`` counts) instead of detonating the queue.
-* Secure: auth is a corpus-scoped ``CorpusAccessToken`` sent as
-  ``Authorization: WorkerKey <token>`` over TLS. The corpus is fixed by the
-  token binding — the remote host cannot target another corpus. NO database
-  access to the target is required or possible.
-
-SUBCOMMANDS
------------
-    plan     Scan ``--root-dir`` and record every PDF in the ledger (no network,
-             no parsing).
-    run      Parse + embed + upload PENDING/FAILED docs (resumable, paced,
-             concurrent).
-    verify   Poll the target for each uploaded doc's terminal status and update
-             the ledger (UPLOADED -> COMPLETED / FAILED).
-    status   Print ledger counts + the target's live worker-upload backlog.
-
-ENVIRONMENT / FLAGS (flags override env)
-----------------------------------------
-    OC_TARGET_URL     Base URL of the target OC instance (e.g. https://oc.example.com)
-    OC_WORKER_TOKEN   CorpusAccessToken plaintext (WorkerKey auth)
-    OC_CORPUS_ID      Informational; the bound corpus is enforced by the token
-    DOCLING_PARSER_SERVICE_URL    Docling microservice (default from Django settings)
-    EMBEDDINGS_MICROSERVICE_URL   Vector embedder microservice
-
-This script runs INSIDE the OpenContracts image (it imports the real parser),
-so Django must be importable. Only the ``run`` subcommand needs Django/Docling;
-``plan`` / ``status`` / ``verify`` are pure HTTP + SQLite.
+Commands: plan scans extensions into a SQLite ledger; run prepares/uploads
+pending or failed documents; verify polls receipts; status prints ledger counts.
+Only run boots Django. See README.md for parser configuration and service setup.
 """
 
 from __future__ import annotations
@@ -72,35 +16,77 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import sqlite3
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+import uuid
+from collections import Counter
+from collections.abc import Generator, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import closing
+from dataclasses import asdict, dataclass
+from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import requests
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from opencontractserver.utils.embedding_validation import (  # noqa: E402
+    embedding_batch,
+    embedding_values,
+    normalize_embedding_vector,
+    validate_embedding_vector,
+)
+from scripts.remote_ingest.admission import (  # noqa: E402
+    AdmissionGovernor,
+    StatusPollError,
+    retry_after_seconds,
+    validate_watermarks,
+)
+
 if TYPE_CHECKING:  # avoid importing enrichers (needs Django path) at module load
     from enrichers import MetadataOverlay
+
+    from scripts.remote_ingest.parsers import LocalParsers
 
 logger = logging.getLogger("oc_remote_ingest")
 
 # --- Defaults --------------------------------------------------------------
 DEFAULT_EXTENSIONS = ".pdf"
 DEFAULT_MAX_WORKERS = 4
+DEFAULT_LEDGER_PAGE_SIZE = 256
+FUTURES_PER_WORKER = 2
+VERIFY_COMPLETE = 0
+VERIFY_OUTSTANDING = 1
+VERIFY_FAILED = 2
+VERIFY_UNAVAILABLE = 3
+VERIFY_SCHEMA_VERSION = 1
 DEFAULT_EMBED_BATCH = 100
 DEFAULT_MAX_ATTEMPTS = 5
-# Backpressure: pause submitting when the target has more than HIGH worker
-# uploads still PENDING+PROCESSING, resume once it drains below LOW.
+# Token-scoped outstanding uploads: pause above HIGH, resume at/below LOW.
 DEFAULT_QUEUE_HIGH = 2000
 DEFAULT_QUEUE_LOW = 500
 _HTTP_MAX_RETRIES = 6
 _JITTER_MIN = 0.5
+_HTTP_UPLOAD_TIMEOUT_SECONDS = 300
+_HTTP_STATUS_TIMEOUT_SECONDS = 60
+_HTTP_BACKLOG_TIMEOUT_SECONDS = 30
+_HTTP_EMBED_SINGLE_TIMEOUT_SECONDS = 30
+_HTTP_EMBED_BATCH_TIMEOUT_SECONDS = 120
+_HTTP_INITIAL_BACKOFF_SECONDS = 2
+_HTTP_MAX_BACKOFF_SECONDS = 60
+_HTTP_DEFAULT_RETRY_AFTER_SECONDS = 60
+_HTTP_MAX_RETRY_AFTER_SECONDS = 300
+
+_CLAIMABLE_WHERE = "status IN ('PENDING', 'FAILED')"
+_UNCONFIRMED_WHERE = "status='UPLOADED' AND upload_id IS NOT NULL"
 
 # Ledger statuses
 PENDING = "PENDING"
@@ -108,6 +94,8 @@ UPLOADED = "UPLOADED"  # staged on the server (202 accepted), not yet confirmed
 COMPLETED = "COMPLETED"  # server confirmed terminal success
 FAILED = "FAILED"  # retry-eligible
 PARKED = "PARKED"  # retries exhausted (terminal)
+AMBIGUOUS = "AMBIGUOUS"  # POST started; acceptance/receipt cannot be established
+CONFLICT = "CONFLICT"  # changed source with an accepted or ambiguous prior version
 
 
 # ======================================================================
@@ -121,6 +109,18 @@ class Ledger:
     def __init__(self, path: str):
         self.path = path
         self._local = threading.local()
+        # Create privately before SQLite can write; also harden legacy ledgers
+        # and any existing recovery files before opening/recovering the database.
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        for suffix in ("-wal", "-shm", "-journal"):
+            try:
+                os.chmod(path + suffix, 0o600)
+            except FileNotFoundError:
+                pass
         with self._conn() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS docs (
@@ -138,10 +138,26 @@ class Ledger:
                     completed_at REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_docs_status ON docs(status);
+                CREATE INDEX IF NOT EXISTS idx_docs_claimable_path
+                    ON docs(rel_path) WHERE status IN ('PENDING', 'FAILED');
+                CREATE INDEX IF NOT EXISTS idx_docs_unconfirmed_path
+                    ON docs(rel_path) WHERE status='UPLOADED' AND upload_id IS NOT NULL;
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
                 PRAGMA journal_mode=WAL;
-                PRAGMA synchronous=NORMAL;
+                PRAGMA synchronous=FULL;
                 """)
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(docs)")}
+            for name in (
+                "prior_status",
+                "conflict_sha256",
+                "client_key",
+                "upload_digest",
+            ):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE docs ADD COLUMN {name} TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_docs_ambiguous_path ON docs(rel_path) WHERE status='AMBIGUOUS'"
+            )
 
     def _conn(self) -> sqlite3.Connection:
         # One connection per thread (sqlite connections are not thread-safe).
@@ -150,6 +166,8 @@ class Ledger:
             conn = sqlite3.connect(self.path, timeout=60, isolation_level=None)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout=60000;")
+            # In particular, the pre-POST AMBIGUOUS marker must survive power loss.
+            conn.execute("PRAGMA synchronous=FULL;")
             self._local.conn = conn
         return conn
 
@@ -171,32 +189,180 @@ class Ledger:
     def upsert_doc(
         self, rel_path: str, abs_path: str, size: int, sha256: str, now: float
     ) -> bool:
-        """Insert a doc if new. Returns True if inserted, False if it already existed."""
+        """Reconcile source versions. Return True only for a newly planned path.
+
+        Accepted/unknown uploads retain their source hash and receipt on conflict.
+        A server-rejected version (FAILED/PARKED) may be replaced safely.
+        """
         cur = self._conn().execute(
             "INSERT INTO docs(rel_path, abs_path, size, sha256, status, created_at) "
             "VALUES(?, ?, ?, ?, 'PENDING', ?) "
             "ON CONFLICT(rel_path) DO NOTHING",
             (rel_path, abs_path, size, sha256, now),
         )
-        return cur.rowcount > 0
-
-    def claimable(self) -> list[sqlite3.Row]:
-        return list(
-            self._conn()
-            .execute(
-                "SELECT * FROM docs WHERE status IN ('PENDING', 'FAILED') "
-                "ORDER BY rel_path"
+        if cur.rowcount > 0:
+            return True
+        row = self.get_doc(rel_path)
+        if row["sha256"] == sha256:
+            self._conn().execute(
+                "UPDATE docs SET abs_path=?, size=?, "
+                "status=COALESCE(prior_status, status), prior_status=NULL, "
+                "conflict_sha256=NULL WHERE rel_path=?",
+                (abs_path, size, rel_path),
             )
-            .fetchall()
+        elif (
+            row["upload_id"]
+            or row["upload_digest"]
+            or row["status"]
+            in (
+                UPLOADED,
+                COMPLETED,
+                AMBIGUOUS,
+                CONFLICT,
+            )
+        ):
+            self._conn().execute(
+                "UPDATE docs SET prior_status=COALESCE(prior_status, status), "
+                "status='CONFLICT', conflict_sha256=?, abs_path=? WHERE rel_path=?",
+                (sha256, abs_path, rel_path),
+            )
+            logger.error(
+                "%s: source changed after upload; prior receipt retained. "
+                "Resolve an explicit replace/new-document policy before continuing.",
+                rel_path,
+            )
+        else:
+            self._conn().execute(
+                "UPDATE docs SET abs_path=?, size=?, sha256=?, status='PENDING', "
+                "upload_id=NULL, attempts=0, page_count=NULL, last_error=NULL, "
+                "uploaded_at=NULL, completed_at=NULL, prior_status=NULL, "
+                "conflict_sha256=NULL, client_key=NULL, upload_digest=NULL WHERE rel_path=?",
+                (abs_path, size, sha256, rel_path),
+            )
+        return False
+
+    def get_doc(self, rel_path: str) -> sqlite3.Row:
+        return (
+            self._conn()
+            .execute("SELECT * FROM docs WHERE rel_path=?", (rel_path,))
+            .fetchone()
         )
 
-    def uploaded_unconfirmed(self) -> list[sqlite3.Row]:
-        return list(
-            self._conn()
-            .execute(
-                "SELECT * FROM docs WHERE status='UPLOADED' AND upload_id IS NOT NULL"
+    def mark_upload_started(
+        self,
+        rel_path: str,
+        payload_digest: str | None = None,
+        page_count: int | None = None,
+    ) -> str | None:
+        from uuid import uuid4
+
+        row = self.get_doc(rel_path)
+        if row["upload_digest"] and row["upload_digest"] != payload_digest:
+            self._conn().execute(
+                "UPDATE docs SET status='CONFLICT', "
+                "last_error='Prepared payload changed after submission' WHERE rel_path=?",
+                (rel_path,),
             )
-            .fetchall()
+            raise ValueError(
+                "Prepared payload changed after submission; resolve the existing receipt"
+            )
+        client_key = (row["client_key"] or str(uuid4())) if payload_digest else None
+        self._conn().execute(
+            "UPDATE docs SET status='AMBIGUOUS', upload_id=NULL, "
+            "uploaded_at=NULL, completed_at=NULL, client_key=?, upload_digest=?, "
+            "page_count=COALESCE(?, page_count), "
+            "last_error='Upload started; outcome unknown. Reconcile with the server before replay.' "
+            "WHERE rel_path=?",
+            (client_key, payload_digest, page_count, rel_path),
+        )
+        return client_key
+
+    def mark_rejected(self, rel_path: str) -> None:
+        self._conn().execute(
+            "UPDATE docs SET status='FAILED', client_key=NULL, upload_digest=NULL "
+            "WHERE rel_path=? AND status='AMBIGUOUS'",
+            (rel_path,),
+        )
+
+    def mark_absent(self, rel_path: str) -> None:
+        self._conn().execute(
+            "UPDATE docs SET status='PENDING', last_error=NULL "
+            "WHERE rel_path=? AND status='AMBIGUOUS'",
+            (rel_path,),
+        )
+
+    def blocked_count(self) -> int:
+        return self._count("status IN ('CONFLICT', 'AMBIGUOUS')")
+
+    def _iter_rows(
+        self, where: str, index: str, page_size: int
+    ) -> Generator[sqlite3.Row]:
+        """One pass in immutable path order; visited failures wait for the next run.
+
+        Pages release their read cursor before yielding so worker writes neither
+        shift an OFFSET nor keep a long-lived SQLite read snapshot/WAL open.
+        One CLI invocation owns the ledger; concurrent plan/run/verify is unsupported.
+        ``where``/``index`` are internal SQL constants, never operator input.
+        """
+        if page_size <= 0:
+            raise ValueError("ledger page size must be positive")
+        after = None
+        while True:
+            keyset = "" if after is None else " AND rel_path > ?"
+            params = (page_size,) if after is None else (after, page_size)
+            with closing(
+                self._conn().execute(
+                    # Force the matching path index: SQLite can otherwise choose the
+                    # status index and re-sort the remaining ledger on every page.
+                    f"SELECT * FROM docs INDEXED BY {index} "
+                    f"WHERE {where}{keyset} ORDER BY rel_path LIMIT ?",
+                    params,
+                )
+            ) as cursor:
+                rows = cursor.fetchmany(page_size)
+            if not rows:
+                return
+            after = rows[-1]["rel_path"]
+            yield from rows
+            if len(rows) < page_size:
+                return
+            del rows
+
+    def _count(self, where: str) -> int:
+        return (
+            self._conn()
+            .execute(f"SELECT COUNT(*) FROM docs WHERE {where}")
+            .fetchone()[0]
+        )
+
+    def claimable_count(self) -> int:
+        return self._count(_CLAIMABLE_WHERE)
+
+    def ambiguous(
+        self, page_size: int = DEFAULT_LEDGER_PAGE_SIZE
+    ) -> Generator[sqlite3.Row]:
+        where = "status='AMBIGUOUS' AND client_key IS NOT NULL"
+        if self._count(where):
+            yield from self._iter_rows(where, "idx_docs_ambiguous_path", page_size)
+
+    def claimable(
+        self, page_size: int = DEFAULT_LEDGER_PAGE_SIZE
+    ) -> Generator[sqlite3.Row]:
+        return self._iter_rows(_CLAIMABLE_WHERE, "idx_docs_claimable_path", page_size)
+
+    def all_docs(
+        self, page_size: int = DEFAULT_LEDGER_PAGE_SIZE
+    ) -> Generator[sqlite3.Row]:
+        return self._iter_rows("1=1", "sqlite_autoindex_docs_1", page_size)
+
+    def uploaded_unconfirmed_count(self) -> int:
+        return self._count(_UNCONFIRMED_WHERE)
+
+    def uploaded_unconfirmed(
+        self, page_size: int = DEFAULT_LEDGER_PAGE_SIZE
+    ) -> Generator[sqlite3.Row]:
+        return self._iter_rows(
+            _UNCONFIRMED_WHERE, "idx_docs_unconfirmed_path", page_size
         )
 
     def mark_uploaded(
@@ -217,8 +383,19 @@ class Ledger:
     def mark_failed(self, rel_path: str, error: str, max_attempts: int) -> None:
         conn = self._conn()
         row = conn.execute(
-            "SELECT attempts FROM docs WHERE rel_path=?", (rel_path,)
+            "SELECT attempts, status FROM docs WHERE rel_path=?", (rel_path,)
         ).fetchone()
+        if row and row["status"] == AMBIGUOUS:
+            conn.execute(
+                "UPDATE docs SET last_error=? WHERE rel_path=?",
+                (
+                    f"Ambiguous upload; reconcile before replay: {error}"[:1000],
+                    rel_path,
+                ),
+            )
+            return  # Preparation retries must never authorize an uncertain POST replay.
+        if row and row["status"] == CONFLICT:
+            return
         attempts = (row["attempts"] if row else 0) + 1
         status = PARKED if attempts >= max_attempts else FAILED
         conn.execute(
@@ -257,6 +434,19 @@ class Config:
     verify_tls: bool
     limit: int
     enrichers: list[str]
+    parser_config: str | None = None
+    ledger_page_size: int = DEFAULT_LEDGER_PAGE_SIZE
+    enricher_identity: str | None = None
+    embedding_identity: str | None = None
+    embedding_dimension: int = 384
+    parser_identity: str | None = None
+    json_output: bool = False
+    ingestion_run_id: str | None = None
+    run_ceiling_usd: str | None = None
+    run_embedding_mode: str = "prepared"
+    run_operation_id: str | None = None
+    run_offset: int = 0
+    readiness: bool = False
 
 
 class TargetClient:
@@ -271,72 +461,273 @@ class TargetClient:
 
     @staticmethod
     def _backoff(attempt: int) -> float:
-        return min(2.0 * (2 ** (attempt - 1)), 60.0) * random.uniform(_JITTER_MIN, 1.0)
+        return min(
+            _HTTP_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+            _HTTP_MAX_BACKOFF_SECONDS,
+        ) * random.uniform(_JITTER_MIN, 1.0)
 
-    def upload(self, pdf_path: str, metadata: dict) -> str:
-        """POST a document. Returns the server upload_id. Raises on permanent failure."""
+    def ingestion_run_status(self, *, offset=0) -> dict:
+        run_id = str(uuid.UUID(str(self.cfg.ingestion_run_id)))
+        report = self._status_json(
+            f"{self.base}/api/worker-uploads/runs/{run_id}/?offset={int(offset)}", 30
+        )
+        required = {
+            "id",
+            "status",
+            "policy",
+            "accounted_usd",
+            "reserved_usd",
+            "remaining_usd",
+        }
+        if not required.issubset(report) or report["id"] != run_id:
+            raise StatusPollError("Invalid ingestion run status", permanent=True)
+        return report
+
+    def ingestion_run_request(self, payload: dict, *, create=False) -> dict:
+        suffix = "" if create else f"{uuid.UUID(str(self.cfg.ingestion_run_id))}/"
+        try:
+            response = self.session.post(
+                f"{self.base}/api/worker-uploads/runs/{suffix}",
+                json=payload,
+                timeout=30,
+                verify=self._verify,
+                allow_redirects=False,
+            )
+        except requests.RequestException:
+            raise StatusPollError(
+                "Run control outcome unknown; fetch status before retrying"
+            ) from None
+        if response.status_code not in (200, 201):
+            raise StatusPollError(
+                f"Run request rejected: HTTP {response.status_code}", permanent=True
+            )
+        try:
+            return response.json()
+        except ValueError:
+            raise StatusPollError(
+                "Invalid run control response", permanent=True
+            ) from None
+
+    def upload(
+        self,
+        source_bytes: bytes,
+        metadata: dict,
+        *,
+        filename: str,
+        idempotency_key: str | None = None,
+    ) -> str:
+        """Send the immutable preparation snapshot; never replay an uncertain POST.
+
+        Only explicit 429 rejections are retried. A transport error, 5xx, redirect
+        or unusable success receipt can follow acceptance and is ambiguous.
+        """
         url = f"{self.base}/api/worker-uploads/documents/"
-        meta_json = json.dumps(metadata)
-        last_error = "unknown"
+        meta_json = json.dumps(metadata, allow_nan=False)
         for attempt in range(1, _HTTP_MAX_RETRIES + 1):
             try:
-                with open(pdf_path, "rb") as fh:
+                with BytesIO(source_bytes) as fh:
                     resp = self.session.post(
                         url,
-                        files={
-                            "file": (
-                                PurePosixPath(pdf_path).name,
-                                fh,
-                                "application/pdf",
-                            )
-                        },
+                        files={"file": (filename, fh, metadata["file_type"])},
                         data={"metadata": meta_json},
-                        timeout=300,
+                        headers=(
+                            {"Idempotency-Key": idempotency_key}
+                            if idempotency_key
+                            else {}
+                        ),
+                        timeout=_HTTP_UPLOAD_TIMEOUT_SECONDS,
                         verify=self._verify,
+                        allow_redirects=False,
                     )
-                if resp.status_code == 202:
-                    return resp.json()["upload_id"]
-                if resp.status_code == 429:
-                    wait = float(resp.headers.get("Retry-After", "60"))
-                    logger.warning(f"429 rate-limited; sleeping {wait}s")
-                    time.sleep(wait)
-                    continue
-                if 400 <= resp.status_code < 500:
-                    # Permanent (bad payload / auth / too large) — do not retry.
-                    raise PermanentUploadError(
-                        f"HTTP {resp.status_code}: {resp.text[:500]}"
-                    )
-                last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
-            except PermanentUploadError:
-                raise
-            except requests.RequestException as e:
-                last_error = f"network: {e}"
-            if attempt < _HTTP_MAX_RETRIES:
-                time.sleep(self._backoff(attempt))
-        raise TransientUploadError(
-            f"upload failed after {_HTTP_MAX_RETRIES} attempts: {last_error}"
-        )
+            except requests.RequestException:
+                raise AmbiguousUploadError(
+                    "Upload response lost; reconcile server acceptance before replay"
+                ) from None
+            if resp.status_code == 202:
+                try:
+                    receipt = resp.json()["upload_id"]
+                    if not isinstance(receipt, str) or not receipt.strip():
+                        raise ValueError
+                    return receipt
+                except (ValueError, KeyError, TypeError):
+                    raise AmbiguousUploadError(
+                        "Upload accepted without a usable receipt; reconcile with server"
+                    ) from None
+            if resp.status_code == 429:
+                if attempt < _HTTP_MAX_RETRIES:
+                    try:
+                        delay = float(
+                            resp.headers.get(
+                                "Retry-After", str(_HTTP_DEFAULT_RETRY_AFTER_SECONDS)
+                            )
+                        )
+                        if not math.isfinite(delay) or delay < 0:
+                            raise ValueError
+                    except (ValueError, TypeError):
+                        delay = self._backoff(attempt)
+                    time.sleep(min(delay, _HTTP_MAX_RETRY_AFTER_SECONDS))
+                continue
+            if resp.status_code == 409:
+                raise AmbiguousUploadError(
+                    "Idempotency conflict; reconcile the existing key before changing the payload"
+                )
+            if 400 <= resp.status_code < 500:
+                raise PermanentUploadError(f"Upload rejected: HTTP {resp.status_code}")
+            raise AmbiguousUploadError(
+                f"Upload outcome unknown: HTTP {resp.status_code}; reconcile before replay"
+            )
+        raise TransientUploadError("Upload rejected: rate limit retries exhausted")
 
-    def upload_status(self, upload_id: str) -> dict | None:
+    def _status_json(self, url: str, timeout: int) -> dict:
+        """Shared safe HTTP classification; admission and verify choose policy."""
+        try:
+            resp = self.session.get(
+                url, timeout=timeout, verify=self._verify, allow_redirects=False
+            )
+        except (
+            requests.exceptions.InvalidURL,
+            requests.exceptions.InvalidSchema,
+            requests.exceptions.MissingSchema,
+            requests.exceptions.InvalidHeader,
+        ):
+            raise StatusPollError(
+                "Invalid status request; check --target-url and --worker-token configuration",
+                permanent=True,
+                reason="invalid_request",
+            ) from None
+        except requests.RequestException:
+            raise StatusPollError(
+                "Status network error or timeout", reason="network_error"
+            ) from None
+        code = resp.status_code
+        if code != 200:
+            if code == 429 or 500 <= code < 600:
+                raise StatusPollError(
+                    f"Status unavailable: HTTP {code}",
+                    reason="rate_limited" if code == 429 else "server_unavailable",
+                    http_status=code,
+                    retry_after=retry_after_seconds(resp.headers.get("Retry-After")),
+                )
+            hint = (
+                "check --worker-token / OC_WORKER_TOKEN and worker/token permissions"
+                if code in (401, 403)
+                else "check --target-url and worker-upload API configuration"
+            )
+            raise StatusPollError(
+                f"Status HTTP {code}; {hint}",
+                permanent=True,
+                reason={401: "unauthorized", 403: "forbidden", 404: "not_found"}.get(
+                    code, "http_error"
+                ),
+                http_status=code,
+            )
+        try:
+            body = resp.json()
+        except ValueError:
+            raise StatusPollError("Invalid status response: malformed JSON") from None
+        if not isinstance(body, dict):
+            raise StatusPollError("Invalid status response: expected a JSON object")
+        return body
+
+    def upload_status(self, upload_id: str) -> dict:
         url = f"{self.base}/api/worker-uploads/documents/{upload_id}/"
-        resp = self.session.get(url, timeout=60, verify=self._verify)
-        if resp.status_code == 200:
-            return resp.json()
-        return None
+        try:
+            body = self._status_json(url, _HTTP_STATUS_TIMEOUT_SECONDS)
+        except StatusPollError as exc:
+            if exc.http_status == 404:
+                raise StatusPollError(
+                    "Receipt missing or inaccessible under the current worker token (HTTP 404)",
+                    reason="not_found",
+                    http_status=404,
+                    permanent=True,
+                ) from None
+            raise
+        if (
+            body.get("upload_id") != upload_id
+            or body.get("status")
+            not in ("PENDING", "PROCESSING", "COMPLETED", "FAILED")
+            or not isinstance(body.get("error_message", ""), str)
+        ):
+            raise StatusPollError("Invalid status response: receipt identity or state")
+        return body
+
+    def lookup_upload(self, client_key: str) -> dict | None:
+        from urllib.parse import quote
+
+        body = self._status_json(
+            f"{self.base}/api/worker-uploads/documents/by-key/{quote(client_key, safe='')}/",
+            _HTTP_STATUS_TIMEOUT_SECONDS,
+        )
+        if (
+            body.get("schema_version") != 1
+            or body.get("client_key") != client_key
+            or type(body.get("found")) is not bool
+        ):
+            raise StatusPollError("Invalid upload lookup response")
+        if not body["found"]:
+            return None  # Only this explicit, authenticated envelope proves absence.
+        if (
+            not isinstance(body.get("upload_id"), str)
+            or not body["upload_id"]
+            or body.get("status") not in (PENDING, "PROCESSING", COMPLETED, FAILED)
+        ):
+            raise StatusPollError("Invalid upload lookup receipt")
+        return body
+
+    def retry_upload(self, upload_id: str) -> str:
+        try:
+            response = self.session.post(
+                f"{self.base}/api/worker-uploads/documents/{upload_id}/retry/",
+                timeout=_HTTP_STATUS_TIMEOUT_SECONDS,
+                verify=self._verify,
+                allow_redirects=False,
+            )
+            if response.status_code != 202:
+                raise StatusPollError(
+                    f"Receipt retry unavailable (HTTP {response.status_code})"
+                )
+            body = response.json()
+        except (requests.RequestException, ValueError):
+            raise StatusPollError(
+                "Receipt retry response unavailable; retained original receipt"
+            ) from None
+        if not isinstance(body, dict) or body.get("upload_id") != upload_id:
+            raise StatusPollError("Invalid retry receipt")
+        return upload_id
+
+    def readiness_status(self, upload_id: str) -> dict:
+        body = self._status_json(
+            f"{self.base}/api/readiness/worker/{upload_id}/",
+            _HTTP_STATUS_TIMEOUT_SECONDS,
+        )
+        if (
+            body.get("schema_version") != 1
+            or body.get("upload_id") != upload_id
+            or body.get("state")
+            not in ("ready", "outstanding", "failed", "unavailable")
+            or (body.get("state") == "ready" and not body.get("generation"))
+        ):
+            raise StatusPollError(
+                "Invalid readiness response: identity, generation or state"
+            )
+        return body
 
     def backlog_count(self) -> int:
-        """PENDING + PROCESSING uploads for this token (drives backpressure)."""
+        """Worker/corpus PENDING + PROCESSING count, or StatusPollError.
+
+        The two requests are not an atomic snapshot or a server-wide queue metric.
+        Neither a partial aggregate nor an unavailable count is usable capacity.
+        """
         total = 0
         for st in ("PENDING", "PROCESSING"):
             url = f"{self.base}/api/worker-uploads/documents/list/?status={st}&page_size=1"
-            try:
-                resp = self.session.get(url, timeout=30, verify=self._verify)
-                if resp.status_code == 200:
-                    total += int(resp.json().get("count", 0))
-            except requests.RequestException:
-                # Treat polling failure as "no backpressure signal" — better to
-                # keep moving than to stall the whole run on a flaky status call.
-                return 0
+            body = self._status_json(url, _HTTP_BACKLOG_TIMEOUT_SECONDS)
+            count = body.get("count")
+            if type(count) is not int or count < 0:
+                raise StatusPollError(
+                    "Invalid status response: expected a nonnegative integer count"
+                )
+            total += count
         return total
 
 
@@ -348,6 +739,10 @@ class TransientUploadError(Exception):
     pass
 
 
+class AmbiguousUploadError(Exception):
+    pass
+
+
 # ======================================================================
 # Embedder client (vector-embedder microservice)
 # ======================================================================
@@ -356,31 +751,36 @@ class TransientUploadError(Exception):
 class EmbedderClient:
     """Thin HTTP client for the vector-embedder microservice."""
 
-    def __init__(self, service_url: str, api_key: str | None, batch_size: int):
+    def __init__(
+        self,
+        service_url: str,
+        api_key: str | None,
+        batch_size: int,
+        *,
+        dimension: int = 384,
+        identity: str | None = None,
+    ):
         self.base = service_url.rstrip("/")
         self.session = requests.Session()
         if api_key:
             self.session.headers["X-API-Key"] = api_key
         self.batch_size = batch_size
+        self.dimension = dimension
+        self.identity = identity
 
     def embed_text(self, text: str) -> list[float] | None:
         if not text or not text.strip():
             return None
         resp = self.session.post(
-            f"{self.base}/embeddings", json={"text": text}, timeout=30
+            f"{self.base}/embeddings",
+            json={"text": text},
+            timeout=_HTTP_EMBED_SINGLE_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
-        return self._coerce_vector(resp.json().get("embeddings"))
+        return self._coerce_vector(embedding_values(resp.json()))
 
-    @staticmethod
-    def _coerce_vector(vec) -> list[float] | None:
-        """Accept either a 1-D vector or a 2-D ``[[...]]`` single-row response."""
-        if not isinstance(vec, list) or not vec:
-            return None
-        if isinstance(vec[0], list):  # 2-D (batch-shaped) single response
-            inner = vec[0]
-            return inner if inner else None
-        return vec
+    def _coerce_vector(self, vec) -> list[float]:
+        return normalize_embedding_vector(vec, self.dimension)
 
     def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
         """Embed a list of texts (sub-batched). Empty texts map to None."""
@@ -393,152 +793,63 @@ class EmbedderClient:
             resp = self.session.post(
                 f"{self.base}/embeddings/batch",
                 json={"texts": chunk_texts},
-                timeout=120,
+                timeout=_HTTP_EMBED_BATCH_TIMEOUT_SECONDS,
             )
             resp.raise_for_status()
-            vecs = resp.json().get("embeddings")
-            if not isinstance(vecs, list):
-                continue
+            vecs = embedding_batch(resp.json(), len(chunk_idxs))
             for local_i, vec in enumerate(vecs):
                 # The batch endpoint wraps each row one level deeper than the
                 # single endpoint (per-item shape is ``[[...floats...]]``), so
                 # coerce each row down to a flat numeric vector.
                 coerced = self._coerce_vector(vec)
-                if coerced is not None:
-                    out[chunk_idxs[local_i]] = coerced
+                out[chunk_idxs[local_i]] = coerced
         return out
 
 
 # ======================================================================
-# Parser wrapper (lazy Django + DoclingParser singleton)
+# Parser wrapper (Django imports + worker-local configuration)
 # ======================================================================
 
 
 class _Parser:
-    """Lazily-initialised, thread-safe singleton wrapper around DoclingParser."""
+    """Bootstrap Django imports, then use explicitly configured local parsers."""
 
-    def __init__(self) -> None:
-        self._parser = None
-        self._build_translation_layer = None
-        self._default_embedder_path = None
-        self._lock = threading.Lock()
+    def __init__(
+        self, config_path: str | None = None, identity: str | None = None
+    ) -> None:
+        self.config_path = config_path
+        self.operator_identity = identity
+        self._parsers: LocalParsers | None = None
 
-    def _ensure(self) -> None:
-        if self._parser is not None:
-            return
-        with self._lock:
-            if self._parser is not None:
-                return
-            # Ensure the OpenContracts repo root is importable. When this file is
-            # run directly (``python .../oc_remote_ingest.py``) sys.path[0] is the
-            # script's own directory, so ``config`` / ``opencontractserver`` are
-            # not importable until we add the repo root (this file lives at
-            # ``<root>/scripts/remote_ingest/oc_remote_ingest.py``).
-            repo_root = str(Path(__file__).resolve().parents[2])
-            if repo_root not in sys.path:
-                sys.path.insert(0, repo_root)
+    def ensure_ready(self) -> LocalParsers:
+        if self._parsers is not None:
+            return self._parsers
+        repo_root = str(Path(__file__).resolve().parents[2])
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.remote_worker")
+        import django
 
-            os.environ.setdefault(
-                "DJANGO_SETTINGS_MODULE", "config.settings.remote_worker"
-            )
-            import django
+        django.setup()
+        from scripts.remote_ingest.parsers import LocalParsers
 
-            django.setup()
-            from plasmapdf.models.PdfDataLayer import build_translation_layer
-
-            from opencontractserver.pipeline.parsers.docling_parser_rest import (
-                DoclingParser,
-            )
-
-            try:
-                from opencontractserver.pipeline.utils import get_default_embedder_path
-
-                self._default_embedder_path = get_default_embedder_path()
-            except Exception:
-                self._default_embedder_path = (
-                    "opencontractserver.pipeline.embedders."
-                    "sent_transformer_microservice.MicroserviceEmbedder"
-                )
-
-            self._build_translation_layer = build_translation_layer
-            self._parser = DoclingParser()
-
-            # Pipeline component settings (incl. the Docling service URL) are
-            # normally sourced from the PipelineSettings DB table — the
-            # ``env_var`` declared on each setting only SEEDS that table via
-            # ``migrate_pipeline_settings``, it is not read at runtime. The
-            # remote worker runs WITHOUT that DB, so the parser comes up with
-            # dataclass defaults (service_url=""). Backfill the Docling knobs
-            # from the environment so the worker is configured purely via env,
-            # mirroring how the in-cluster parser is seeded from the same vars.
-            self._backfill_parser_settings_from_env()
-
-            if not self._parser.service_url:
-                raise RuntimeError(
-                    "DOCLING_PARSER_SERVICE_URL must be set so the remote worker "
-                    "can reach the Docling microservice."
-                )
-            logger.info(
-                f"DoclingParser ready (service={self._parser.service_url!r}, "
-                f"extract_images={self._parser.extract_images}, "
-                f"embedder_path={self._default_embedder_path})"
-            )
-
-    def _backfill_parser_settings_from_env(self) -> None:
-        """Override DoclingParser instance settings from DOCLING_* env vars.
-
-        Only applied when the value is present in the environment, so a worker
-        that sets nothing inherits the same defaults the in-cluster parser uses.
-        """
-
-        def _set(attr: str, env_var: str, cast) -> None:
-            raw = os.environ.get(env_var)
-            if raw is None or raw == "":
-                return
-            try:
-                setattr(self._parser, attr, cast(raw))
-            except (ValueError, TypeError):
-                logger.warning(f"Ignoring invalid {env_var}={raw!r}")
-
-        def _as_bool(v: str) -> bool:
-            return v.strip().lower() in ("1", "true", "yes", "on")
-
-        _set("service_url", "DOCLING_PARSER_SERVICE_URL", str)
-        _set("request_timeout", "DOCLING_PARSER_TIMEOUT", int)
-        _set("extract_images", "DOCLING_EXTRACT_IMAGES", _as_bool)
-        _set("image_format", "DOCLING_IMAGE_FORMAT", str)
-        _set("image_quality", "DOCLING_IMAGE_QUALITY", int)
-        _set("image_dpi", "DOCLING_IMAGE_DPI", int)
-        _set("min_image_width", "DOCLING_MIN_IMAGE_WIDTH", int)
-        _set("min_image_height", "DOCLING_MIN_IMAGE_HEIGHT", int)
-        _set("max_pages_per_chunk", "DOCLING_MAX_PAGES_PER_CHUNK", int)
-        _set("min_pages_for_chunking", "DOCLING_MIN_PAGES_FOR_CHUNKING", int)
-        _set("max_concurrent_chunks", "DOCLING_MAX_CONCURRENT_CHUNKS", int)
-        _set("chunk_overlap", "DOCLING_CHUNK_OVERLAP", int)
-
-    def ensure_ready(self) -> None:
-        """Eagerly set up Django + the parser (used to fail fast on config errors
-        and to make ``config`` / ``opencontractserver`` importable before
-        enrichers are loaded)."""
-        self._ensure()
+        parsers = LocalParsers(self.config_path, identity=self.operator_identity)
+        parsers.require_checkpoint_identities()
+        self._parsers = parsers
+        return self._parsers
 
     @property
     def default_embedder_path(self) -> str:
-        self._ensure()
-        return self._default_embedder_path
+        return self.ensure_ready().default_embedder_path
 
-    def parse(self, pdf_bytes: bytes) -> dict:
-        self._ensure()
-        result = self._parser.parse_pdf_bytes(pdf_bytes, user_id=0, doc_id=0)
-        if result is None:
-            raise RuntimeError("parser returned no result")
-        return result
+    def parse(self, source_bytes: bytes, *, filename: str) -> dict:
+        return self.ensure_ready().parse(source_bytes, filename=filename)
 
-    def text_from_pawls(self, pawls_pages: list) -> str:
-        self._ensure()
-        if not pawls_pages:
-            return ""
-        return self._build_translation_layer(pawls_pages).doc_text
+    def identity(self, mime: str) -> dict:
+        return self.ensure_ready().identity(mime)
+
+    def source_mime(self, source_bytes: bytes, *, filename: str) -> str:
+        return self.ensure_ready().source_mime(source_bytes, filename=filename)
 
 
 # ======================================================================
@@ -547,7 +858,6 @@ class _Parser:
 
 # Mirror save_parsed_data's structural-label definitions so the target
 # auto-creates any labels the parser emitted with identical presentation.
-_TOKEN_LABEL = "TOKEN_LABEL"
 _RELATIONSHIP_LABEL = "RELATIONSHIP_LABEL"
 _DOC_TYPE_LABEL = "DOC_TYPE_LABEL"
 
@@ -560,8 +870,16 @@ def _build_metadata(
     embedder_path: str,
     embeddings: dict | None,
     target_folder_path: str | None,
+    parser_name: str,
+    parser_version: str = "1.0",
     overlay: MetadataOverlay | None = None,
 ) -> dict:
+    from django.conf import settings
+
+    from scripts.remote_ingest.parsers import canonical_mime
+
+    file_type = canonical_mime(export.get("file_type"))
+    fallback = settings.ANNOTATION_LABELS.get(file_type, "SPAN_LABEL")
     labelled_text = export.get("labelled_text", []) or []
     relationships = export.get("relationships", []) or []
     doc_label_names = list(export.get("doc_labels", []) or [])
@@ -574,7 +892,7 @@ def _build_metadata(
         name = ann.get("annotationLabel")
         if name and name not in text_labels:
             text_labels[name] = {
-                "label_type": ann.get("annotation_type") or _TOKEN_LABEL,
+                "label_type": ann.get("annotation_type") or fallback,
                 "color": "grey",
                 "description": "Parser Structural Label",
                 "icon": "expand",
@@ -625,15 +943,15 @@ def _build_metadata(
         "content": content,
         "page_count": export.get("page_count")
         or len(export.get("pawls_file_content", [])),
-        "file_type": export.get("file_type", "application/pdf") or "application/pdf",
+        "file_type": file_type,
         "pawls_file_content": export.get("pawls_file_content", []),
         "labelled_text": labelled_text,
         "relationships": relationships,
         "doc_labels": doc_label_names,
         "text_labels": text_labels,
         "doc_labels_definitions": doc_labels_definitions,
-        "parser_name": "Docling Parser (REST)",
-        "parser_version": "1.0",
+        "parser_name": parser_name,
+        "parser_version": parser_version,
     }
     if target_folder_path:
         metadata["target_folder_path"] = target_folder_path
@@ -652,37 +970,64 @@ def _compute_embeddings(
     embedder_path: str,
     content: str,
     labelled_text: list,
-) -> dict | None:
+) -> dict:
     """Compute the doc-level + per-annotation embeddings the server would store."""
-    doc_vec = embedder.embed_text(content)
-
-    # Annotation embeddings keyed by the annotation's stable export ``id``
-    # (the same id the worker-upload path maps to the new DB pk).
-    ann_ids: list = []
-    ann_texts: list[str] = []
-    for ann in labelled_text:
-        ann_id = ann.get("id")
-        raw = ann.get("rawText") or ""
-        if ann_id is not None and raw.strip():
-            ann_ids.append(ann_id)
-            ann_texts.append(raw)
-
-    annotation_embeddings: dict[str, list[float]] = {}
-    if ann_texts:
-        vecs = embedder.embed_batch(ann_texts)
-        for ann_id, vec in zip(ann_ids, vecs):
-            if vec is not None:
-                annotation_embeddings[str(ann_id)] = vec
-
-    if doc_vec is None and not annotation_embeddings:
-        return None
-
-    payload: dict = {"embedder_path": embedder_path}
-    if doc_vec is not None:
-        payload["document_embedding"] = doc_vec
-    if annotation_embeddings:
-        payload["annotation_embeddings"] = annotation_embeddings
+    ann_ids = _embedding_ids(labelled_text)
+    try:
+        doc_vec = embedder.embed_text(content)
+        _validate_vector(doc_vec, embedder.dimension)
+    except ValueError as exc:
+        raise ValueError(f"Document embedding: {exc}") from exc
+    vecs = embedder.embed_batch(
+        [ann["rawText"] for ann in labelled_text if ann["rawText"].strip()]
+    )
+    if not isinstance(vecs, list) or len(vecs) != len(ann_ids):
+        raise ValueError(
+            "Embedding batch cardinality does not match eligible annotations"
+        )
+    payload = {
+        "embedder_path": embedder_path,
+        "model_identity": embedder.identity,
+        "document_embedding": doc_vec,
+        "annotation_embeddings": dict(zip(ann_ids, vecs)),
+    }
+    _validate_embeddings(payload, labelled_text, embedder.dimension, embedder_path)
     return payload
+
+
+def _embedding_ids(annotations: list) -> list[str]:
+    ids = set()
+    eligible = []
+    for ann in annotations:
+        aid = ann.get("id")
+        if type(aid) not in (str, int) or aid == "" or str(aid) in ids:
+            raise ValueError(
+                "Embeddings require unique string/integer annotation IDs (including JSON keys)"
+            )
+        ids.add(str(aid))
+        if ann["rawText"].strip():
+            eligible.append(str(aid))
+    return eligible
+
+
+def _validate_vector(vector, dimension: int) -> None:
+    validate_embedding_vector(vector, dimension)
+
+
+def _validate_embeddings(payload, annotations, dimension, embedder_path) -> None:
+    if not isinstance(payload, dict) or payload.get("embedder_path") != embedder_path:
+        raise ValueError("Embedding payload is missing or has an incompatible embedder")
+    _validate_vector(payload.get("document_embedding"), dimension)
+    vectors = payload.get("annotation_embeddings", {})
+    if not isinstance(vectors, dict) or set(vectors) != set(
+        _embedding_ids(annotations)
+    ):
+        raise ValueError("Embedding coverage does not match eligible annotation IDs")
+    for annotation_id, vector in vectors.items():
+        try:
+            _validate_vector(vector, dimension)
+        except ValueError as exc:
+            raise ValueError(f"Annotation {annotation_id!r} embedding: {exc}") from exc
 
 
 # ======================================================================
@@ -699,14 +1044,27 @@ def _sha256(path: str) -> str:
 
 
 def _scan(root: str, extensions: tuple[str, ...]):
+    """Stream depth-first in filesystem order, without following directory links.
+
+    Retain only one scandir iterator per depth, even for a very wide directory.
+    Closing the generator (e.g. at --limit) closes every open directory handle.
+    """
     root_path = Path(root).resolve()
-    for path in sorted(root_path.rglob("*")):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in extensions:
-            continue
-        rel = path.relative_to(root_path).as_posix()
-        yield rel, str(path)
+    stack = [os.scandir(root_path)]
+    try:
+        while stack:
+            entry = next(stack[-1], None)
+            if entry is None:
+                stack.pop().close()
+            elif entry.is_dir(follow_symlinks=False):
+                stack.append(os.scandir(entry.path))
+            elif entry.is_file():
+                path = Path(entry.path)
+                if path.suffix.lower() in extensions:
+                    yield path.relative_to(root_path).as_posix(), str(path)
+    finally:
+        for entries in stack:
+            entries.close()
 
 
 # ======================================================================
@@ -721,20 +1079,21 @@ def cmd_plan(cfg: Config) -> int:
         ledger.set_meta("corpus_id", cfg.corpus_id)
     now = time.time()
     added = scanned = 0
-    for rel, abs_path in _scan(cfg.root_dir, cfg.extensions):
-        scanned += 1
-        size = os.path.getsize(abs_path)
-        # sha256 is recorded for provenance/dedup; cheap enough at plan time.
-        if ledger.upsert_doc(rel, abs_path, size, _sha256(abs_path), now):
-            added += 1
-        if cfg.limit and added >= cfg.limit:
-            logger.info(f"reached --limit {cfg.limit}; stopping scan")
-            break
-        if scanned % 500 == 0:
-            logger.info(f"planned {scanned} files ({added} new)…")
+    with closing(_scan(cfg.root_dir, cfg.extensions)) as paths:
+        for rel, abs_path in paths:
+            scanned += 1
+            size = os.path.getsize(abs_path)
+            # sha256 is recorded for provenance/dedup; cheap enough at plan time.
+            if ledger.upsert_doc(rel, abs_path, size, _sha256(abs_path), now):
+                added += 1
+            if cfg.limit and added >= cfg.limit:
+                logger.info(f"reached --limit {cfg.limit}; stopping scan")
+                break
+            if scanned % 500 == 0:
+                logger.info(f"planned {scanned} files ({added} new)…")
     logger.info(f"plan complete: scanned={scanned}, new={added}")
     _print_status(ledger, None)
-    return 0
+    return 1 if ledger.blocked_count() else 0
 
 
 def _process_one(
@@ -742,96 +1101,283 @@ def _process_one(
     parser: _Parser,
     embedder: EmbedderClient | None,
     client: TargetClient,
-    row: sqlite3.Row,
+    row: sqlite3.Row | Mapping[str, Any],
     enrichers: list | None = None,
+    ledger: Ledger | None = None,
 ) -> tuple[str, bool, str]:
-    """Parse + (enrich) + embed + upload one document. Returns (rel_path, ok, message)."""
+    """Prepare/upload and persist the receipt. Return (path, ok, receipt or error)."""
+    from scripts.remote_ingest.checkpoints import (
+        Checkpoints,
+        digest,
+        implementation_digest,
+    )
+    from scripts.remote_ingest.parsers import normalize_and_validate_export
+
     rel_path = row["rel_path"]
-    abs_path = row["abs_path"]
+    owns_ledger = ledger is None
+    ledger = ledger or Ledger(cfg.ledger_path)
     try:
-        with open(abs_path, "rb") as fh:
-            pdf_bytes = fh.read()
-
-        export = parser.parse(pdf_bytes)
-        pawls = export.get("pawls_file_content", []) or []
-
-        # Rebuild the text layer the same way the server's save_parsed_data does
-        # (PAWLs translation), falling back to the parser-reported content.
-        content = parser.text_from_pawls(pawls) or (export.get("content") or "")
-        if not content.strip():
-            return (rel_path, False, "empty content/text layer (would be unsearchable)")
-
-        # Pre-processing / enrichment stage: calculate + inject extra metadata
-        # and annotations BEFORE embedding (so injected annotations get embedded)
-        # and BEFORE building the payload. A validation failure fails the doc.
-        overlay = None
-        if enrichers:
-            from enrichers import (  # local import: needs Django path set up
-                EnricherContext,
-                apply_enrichment,
-                run_enrichers,
-                validate_enrichment,
+        current = ledger.get_doc(rel_path)
+        if current["upload_id"] and current["status"] == FAILED:
+            upload_id = client.retry_upload(current["upload_id"])
+            ledger.mark_uploaded(
+                rel_path, upload_id, current["page_count"], time.time()
+            )
+            return (rel_path, True, upload_id)
+        abs_path = current["abs_path"]
+        # Immutable snapshot: neither parser nor uploader reopens the mutable path.
+        source_bytes = Path(abs_path).read_bytes()
+        source_digest = digest(source_bytes)
+        ledger.upsert_doc(
+            rel_path, abs_path, len(source_bytes), source_digest, time.time()
+        )
+        current = ledger.get_doc(rel_path)
+        if current["status"] not in (PENDING, FAILED):
+            return (
+                rel_path,
+                False,
+                f"{current['status']}: source/receipt requires reconciliation",
             )
 
-            ctx = EnricherContext(
-                rel_path=rel_path, abs_path=abs_path, export=export, content=content
-            )
-            enrichment = run_enrichers(enrichers, ctx)
-            if not enrichment.is_empty():
-                errors = validate_enrichment(export, enrichment)
-                if errors:
-                    return (
-                        rel_path,
-                        False,
-                        "enrichment invalid: " + "; ".join(errors[:5]),
-                    )
-                overlay = apply_enrichment(export, enrichment)
-
-        embeddings = None
-        if cfg.embeddings and embedder is not None:
-            # Compute over the (possibly enriched) labelled_text so injected
-            # annotations are embedded too.
-            embeddings = _compute_embeddings(
-                embedder=embedder,
-                embedder_path=parser.default_embedder_path,
-                content=content,
-                labelled_text=export.get("labelled_text", []) or [],
-            )
-
-        target_folder_path = None
-        if cfg.target_folder_from_tree:
-            parent = PurePosixPath(rel_path).parent.as_posix()
-            target_folder_path = None if parent in (".", "") else parent
-
-        title = PurePosixPath(rel_path).name
-        metadata = _build_metadata(
-            title=title,
-            export=export,
-            content=content,
-            embedder_path=parser.default_embedder_path,
-            embeddings=embeddings,
-            target_folder_path=target_folder_path,
-            overlay=overlay,
+        filename = PurePosixPath(rel_path).name
+        mime = parser.source_mime(source_bytes, filename=filename)
+        identity = parser.identity(mime)
+        cache = Checkpoints(cfg.ledger_path, rel_path)
+        export, parsed_digest = cache.stage(
+            "parse",
+            [source_digest, filename, identity],
+            lambda: parser.parse(source_bytes, filename=filename),
+            normalize_and_validate_export,
         )
 
-        upload_id = client.upload(abs_path, metadata)
+        from enrichers import (
+            EnricherContext,
+            MetadataOverlay,
+            apply_enrichment,
+            run_enrichers,
+            validate_enrichment,
+        )
+
+        def enrich():
+            overlay = MetadataOverlay()
+            if enrichers:
+                ctx = EnricherContext(
+                    rel_path=rel_path,
+                    abs_path=abs_path,
+                    export=export,
+                    content=export["content"],
+                )
+                enrichment = run_enrichers(enrichers, ctx)
+                errors = validate_enrichment(export, enrichment)
+                if errors:
+                    raise ValueError("enrichment invalid: " + "; ".join(errors[:5]))
+                overlay = apply_enrichment(export, enrichment)
+            return {"export": export, "overlay": asdict(overlay)}
+
+        def validate_enriched(value):
+            normalize_and_validate_export(value["export"])
+            overlay = MetadataOverlay(**value["overlay"])
+            if not all(
+                isinstance(v, dict)
+                for v in (
+                    overlay.custom_meta,
+                    overlay.text_label_defs,
+                    overlay.doc_label_defs,
+                )
+            ) or not isinstance(overlay.metadata, list):
+                raise ValueError("Invalid cached enrichment overlay")
+
+        if enrichers and not cfg.enricher_identity:
+            raise ValueError(
+                "--enricher-identity must describe the effective enricher configuration"
+            )
+        enriched, enriched_digest = cache.stage(
+            "enrich",
+            [
+                parsed_digest,
+                rel_path,
+                abs_path,
+                cfg.enricher_identity,
+                [(name, implementation_digest(fn)) for name, fn in (enrichers or [])],
+                implementation_digest(apply_enrichment),
+            ],
+            enrich,
+            validate_enriched,
+        )
+        export = enriched["export"]
+        overlay = MetadataOverlay(**enriched["overlay"])
+        embeddings = None
+        if cfg.embeddings:
+            if embedder is None:
+                raise ValueError("Remote embeddings enabled without an embedder")
+            embeddings, _ = cache.stage(
+                "embed",
+                [
+                    enriched_digest,
+                    parser.default_embedder_path,
+                    embedder.base,
+                    embedder.identity,
+                    embedder.dimension,
+                    implementation_digest(type(embedder).__init__),
+                ],
+                lambda: _compute_embeddings(
+                    embedder=embedder,
+                    embedder_path=parser.default_embedder_path,
+                    content=export["content"],
+                    labelled_text=export.get("labelled_text", []),
+                ),
+                lambda value: _validate_embeddings(
+                    value,
+                    export.get("labelled_text", []),
+                    embedder.dimension,
+                    parser.default_embedder_path,
+                ),
+            )
+
+        parent = PurePosixPath(rel_path).parent.as_posix()
+        metadata = _build_metadata(
+            title=filename,
+            export=export,
+            content=export["content"],
+            embedder_path=parser.default_embedder_path,
+            embeddings=embeddings,
+            target_folder_path=(
+                parent
+                if cfg.target_folder_from_tree and parent not in (".", "")
+                else None
+            ),
+            overlay=overlay,
+            parser_name=identity["parser_name"],
+            parser_version=identity["parser_version"],
+        )
+        # Bind the receipt to source, semantic output, and effective preparation
+        # settings. Only hashes cross the network; settings can contain secrets.
+        from opencontractserver.utils.upload_identity import upload_payload_digest
+        from scripts.remote_ingest.checkpoints import fingerprint
+
+        metadata["preparation_identity"] = fingerprint(
+            [
+                identity,
+                cfg.enricher_identity,
+                cfg.embedding_identity,
+                embedder.base if embedder else None,
+                embedder.dimension if embedder else None,
+            ]
+        )
+        if cfg.ingestion_run_id:
+            metadata["ingestion_run_id"] = cfg.ingestion_run_id
+        payload_digest = upload_payload_digest(source_digest, metadata)
+        client_key = ledger.mark_upload_started(
+            rel_path, payload_digest, metadata["page_count"]
+        )
+        upload_id = client.upload(
+            source_bytes, metadata, filename=filename, idempotency_key=client_key
+        )
         page_count = metadata["page_count"]
-        return (rel_path, True, f"{upload_id}|{page_count}")
-    except PermanentUploadError as e:
-        return (rel_path, False, f"permanent: {e}")
-    except Exception as e:  # noqa: BLE001 — surface any parse/embed/upload failure
+        ledger.mark_uploaded(rel_path, upload_id, page_count, time.time())
+        return (rel_path, True, upload_id)
+    except (PermanentUploadError, TransientUploadError) as e:
+        # Rejecting a replay says nothing about an earlier POST still in flight.
+        if not current["client_key"]:
+            ledger.mark_rejected(rel_path)
         return (rel_path, False, str(e))
+    except Exception as e:  # noqa: BLE001 — ambiguous rows stay unclaimable
+        return (rel_path, False, str(e))
+    finally:
+        if owns_ledger:
+            ledger._conn().close()
+
+
+def _reconcile_ambiguous(
+    ledger: Ledger,
+    client: TargetClient,
+    row,
+    *,
+    replay_absent: bool = False,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> None:
+    if row["status"] != AMBIGUOUS or not row["client_key"]:
+        return
+    receipt = client.lookup_upload(row["client_key"])
+    if receipt is None:
+        if replay_absent:
+            ledger.mark_absent(row["rel_path"])
+        return
+    if receipt.get("payload_digest") != row["upload_digest"]:
+        raise StatusPollError(
+            "Upload lookup payload does not match the durable local digest"
+        )
+    ledger.mark_uploaded(
+        row["rel_path"], receipt["upload_id"], row["page_count"], time.time()
+    )
+    if receipt["status"] == COMPLETED:
+        ledger.mark_completed(row["rel_path"], time.time())
+    elif receipt["status"] == FAILED:
+        ledger.mark_failed(
+            row["rel_path"],
+            f"server: {receipt.get('error_message') or 'failed'}",
+            max_attempts,
+        )
 
 
 def cmd_run(cfg: Config) -> int:
+    try:
+        validate_watermarks(cfg.queue_high, cfg.queue_low)
+    except ValueError as watermark_error:
+        logger.error("%s", watermark_error)
+        return 2
     ledger = Ledger(cfg.ledger_path)
-    parser = _Parser()
+    stored_run = ledger.get_meta("ingestion_run_id")
+    if stored_run and cfg.ingestion_run_id and stored_run != cfg.ingestion_run_id:
+        logger.error(
+            "Ledger belongs to a different ingestion run; use its original run ID"
+        )
+        return 2
+    cfg.ingestion_run_id = cfg.ingestion_run_id or stored_run
+    if cfg.ingestion_run_id:
+        ledger.set_meta("ingestion_run_id", cfg.ingestion_run_id)
+    client = TargetClient(cfg)
+    if cfg.ingestion_run_id:
+        try:
+            report = client.ingestion_run_status()
+        except (StatusPollError, ValueError):
+            logger.error("Ingestion run status unavailable; preparation is paused")
+            return 2
+        if report["status"] != "ACTIVE":
+            print(json.dumps(report, indent=2))
+            return 2
+    for ambiguous_row in ledger.ambiguous(cfg.ledger_page_size):
+        try:
+            _reconcile_ambiguous(
+                ledger,
+                client,
+                ambiguous_row,
+                replay_absent=True,
+                max_attempts=cfg.max_attempts,
+            )
+        except StatusPollError as lookup_error:
+            logger.error(
+                "%s: %s; upload remains ambiguous",
+                ambiguous_row["rel_path"],
+                lookup_error,
+            )
+    if not ledger.claimable_count():
+        if _print_status(ledger, client if cfg.queue_high > 0 else None) == 2:
+            return 2
+        return 1 if ledger.blocked_count() else 0
+    parser = _Parser(cfg.parser_config, cfg.parser_identity)
     # Set up Django + the parser eagerly so config errors (missing service URL,
     # broken enricher import) surface before we start churning documents.
     parser.ensure_ready()
+    if cfg.ingestion_run_id:
+        _validate_run_preparations(cfg, parser, report["policy"])
 
     enrichers: list = []
     if cfg.enrichers:
+        if not cfg.enricher_identity:
+            raise ValueError(
+                "--enricher-identity is required with --enricher; include configuration/data versions"
+            )
         from enrichers import load_enrichers
 
         enrichers = load_enrichers(cfg.enrichers)
@@ -842,114 +1388,287 @@ def cmd_run(cfg: Config) -> int:
 
     embedder = None
     if cfg.embeddings:
+        if not cfg.embedding_identity:
+            raise ValueError(
+                "--embedding-identity is required: identify the deployed model/service revision"
+            )
+        from opencontractserver.annotations.models import EMBEDDING_DIMENSIONS
+
+        if cfg.embedding_dimension not in {dim for dim, _ in EMBEDDING_DIMENSIONS}:
+            raise ValueError("--embedding-dimension is not supported by server storage")
         embedder = EmbedderClient(
             os.environ.get(
                 "EMBEDDINGS_MICROSERVICE_URL", "http://vector-embedder:8000"
             ),
             os.environ.get("VECTOR_EMBEDDER_API_KEY") or None,
             DEFAULT_EMBED_BATCH,
+            dimension=cfg.embedding_dimension,
+            identity=cfg.embedding_identity,
         )
-    client = TargetClient(cfg)
-
-    todo = ledger.claimable()
-    if not todo:
+    total = ledger.claimable_count()
+    if not total:
         logger.info("nothing to do — run `plan` first or everything is done.")
-        _print_status(ledger, client)
-        return 0
+        if _print_status(ledger, client if cfg.queue_high > 0 else None) == 2:
+            return 2
+        return 1 if ledger.blocked_count() else 0
 
+    window = FUTURES_PER_WORKER * cfg.max_workers
     logger.info(
-        f"run: {len(todo)} docs to process with {cfg.max_workers} workers "
+        f"run: {total} docs to process with {cfg.max_workers} workers "
+        f"(future window={window}, ledger page size={cfg.ledger_page_size}) "
         f"(embeddings={'on' if cfg.embeddings else 'off'}, "
         f"enrichers={len(enrichers)})"
     )
 
-    # Backpressure gate shared by all workers.
-    pause_event = threading.Event()
-    pause_event.set()  # set == "go"
-    governor_state = {"last_poll": 0.0, "stop": False}
-    gov_lock = threading.Lock()
-
-    def maybe_poll_backpressure() -> None:
-        if cfg.queue_high <= 0:
-            return
-        with gov_lock:
-            now = time.time()
-            if now - governor_state["last_poll"] < 15:
-                return
-            governor_state["last_poll"] = now
-        backlog = client.backlog_count()
-        if backlog > cfg.queue_high and pause_event.is_set():
-            logger.info(f"backpressure: backlog={backlog} > {cfg.queue_high}; pausing")
-            pause_event.clear()
-        elif backlog <= cfg.queue_low and not pause_event.is_set():
-            logger.info(f"backpressure: backlog={backlog} <= {cfg.queue_low}; resuming")
-            pause_event.set()
+    governor = AdmissionGovernor(client.backlog_count, cfg.queue_high, cfg.queue_low)
+    stop_event = governor.stopped
 
     done = {"ok": 0, "fail": 0}
+    run_stopped = threading.Event()
     done_lock = threading.Lock()
 
     def worker(row: sqlite3.Row) -> None:
-        # Wait while paused (re-poll periodically to unblock).
-        while not pause_event.wait(timeout=10):
-            maybe_poll_backpressure()
-        maybe_poll_backpressure()
-        rel, ok, msg = _process_one(cfg, parser, embedder, client, row, enrichers)
-        now = time.time()
+        # A grant is atomic with polling/pausing; only admitted work uses attempts.
+        if not governor.admit() or stop_event.is_set():
+            return
+        if cfg.ingestion_run_id:
+            try:
+                if client.ingestion_run_status()["status"] != "ACTIVE":
+                    run_stopped.set()
+                    governor.stop()
+                    return
+            except StatusPollError:
+                run_stopped.set()
+                governor.stop()
+                return
+        rel, ok, msg = _process_one(
+            cfg, parser, embedder, client, row, enrichers, ledger
+        )
         if ok:
-            upload_id, _, page_count = msg.partition("|")
-            ledger.mark_uploaded(rel, upload_id, int(page_count or 0), now)
             with done_lock:
                 done["ok"] += 1
                 n = done["ok"] + done["fail"]
-            logger.info(f"[{n}/{len(todo)}] uploaded {rel} -> {upload_id}")
+            logger.info(f"[{n}/{total}] uploaded {rel} -> {msg}")
         else:
             ledger.mark_failed(rel, msg, cfg.max_attempts)
             with done_lock:
                 done["fail"] += 1
                 n = done["ok"] + done["fail"]
-            logger.warning(f"[{n}/{len(todo)}] FAILED {rel}: {msg}")
+            logger.warning(f"[{n}/{total}] FAILED {rel}: {msg}")
 
-    with ThreadPoolExecutor(max_workers=cfg.max_workers) as pool:
-        futures = [pool.submit(worker, row) for row in todo]
-        for fut in as_completed(futures):
-            exc = fut.exception()
-            if exc is not None:
-                logger.error(f"worker crashed: {exc}")
+    todo = ledger.claimable(cfg.ledger_page_size)
+    pool = ThreadPoolExecutor(max_workers=cfg.max_workers)
+    pending: set[Future[None]] = set()
+    exhausted = interrupted = False
+    try:
+        while not stop_event.is_set() and (pending or not exhausted):
+            while not stop_event.is_set() and not exhausted and len(pending) < window:
+                row = next(todo, None)
+                if row is None:
+                    exhausted = True
+                    break
+                if stop_event.is_set():
+                    break
+                pending.add(pool.submit(worker, row))
+            if stop_event.is_set() or not pending:
+                break
+            finished, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in finished:
+                exc = future.exception()
+                if exc is not None:
+                    logger.error("worker crashed: %s", governor.fatal_error or exc)
+                    with done_lock:
+                        done["fail"] += 1
+            finished.clear()
+            del future
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        governor.stop()
+        for future in pending:
+            future.cancel()
+        todo.close()
+        if interrupted:
+            logger.info(
+                "interrupted: cancelling queued work; waiting for at most "
+                f"{cfg.max_workers} already-running document/status calls"
+            )
+        # Avoid the context manager's unconditional wait on governor-paused work.
+        # In-flight preparation/uploads finish and persist their ledger transitions.
+        pool.shutdown(wait=True, cancel_futures=True)
+
+    if interrupted:
+        _print_status(ledger, None)
+        return 130
+
+    if governor.fatal_error is not None:
+        logger.error("Admission stopped: %s", governor.fatal_error)
+        _print_status(ledger, None)
+        return 2
+
+    if run_stopped.is_set():
+        logger.info(
+            "Run admission paused; receipts and preparation checkpoints retained"
+        )
+        return 2
 
     logger.info(f"run complete: uploaded={done['ok']}, failed={done['fail']}")
-    _print_status(ledger, client)
-    return 0 if done["fail"] == 0 else 1
+    if _print_status(ledger, client if cfg.queue_high > 0 else None) == 2:
+        return 2
+    return 0 if done["fail"] == 0 and not ledger.blocked_count() else 1
+
+
+def _verification_state(status: str) -> tuple[int, str]:
+    return {
+        COMPLETED: (VERIFY_COMPLETE, "completed"),
+        PENDING: (VERIFY_OUTSTANDING, "not_uploaded"),
+        UPLOADED: (VERIFY_OUTSTANDING, "receipt_outstanding"),
+        FAILED: (VERIFY_FAILED, "failed"),
+        PARKED: (VERIFY_FAILED, "parked"),
+        AMBIGUOUS: (VERIFY_FAILED, "ambiguous_upload"),
+        CONFLICT: (VERIFY_FAILED, "source_conflict"),
+    }.get(status, (VERIFY_UNAVAILABLE, "unknown_ledger_state"))
 
 
 def cmd_verify(cfg: Config) -> int:
+    """Verify the whole ledger, streaming bounded document results before a summary.
+
+    Receipt unavailability is observational: never change state, attempts, receipt,
+    timestamps or last_error without a valid response. Final ledger state governs
+    success, including failures moved out of UPLOADED on an earlier invocation.
+    """
     ledger = Ledger(cfg.ledger_path)
     client = TargetClient(cfg)
-    pending = ledger.uploaded_unconfirmed()
-    logger.info(f"verify: polling {len(pending)} uploaded docs for terminal status")
-    confirmed = failed = still = 0
-    now = time.time()
-    for row in pending:
-        status = client.upload_status(row["upload_id"])
-        if status is None:
-            still += 1
-            continue
-        st = status.get("status")
-        if st == "COMPLETED":
-            ledger.mark_completed(row["rel_path"], now)
-            confirmed += 1
-        elif st == "FAILED":
-            ledger.mark_failed(
-                row["rel_path"],
-                f"server: {status.get('error_message', 'failed')}",
-                cfg.max_attempts,
-            )
-            failed += 1
-        else:
-            still += 1
-    logger.info(
-        f"verify complete: confirmed={confirmed}, failed={failed}, still-processing={still}"
+    reasons: Counter[str] = Counter()
+    unavailable = 0
+    readiness_code = VERIFY_COMPLETE
+    for row in ledger.all_docs(cfg.ledger_page_size):
+        receipt_status = None
+        poll_error = None
+        try:
+            _reconcile_ambiguous(ledger, client, row, max_attempts=cfg.max_attempts)
+            row = ledger.get_doc(row["rel_path"])
+        except StatusPollError as exc:
+            poll_error = exc
+        if row["status"] == UPLOADED:
+            try:
+                if not row["upload_id"]:
+                    raise StatusPollError(
+                        "Uploaded row has no receipt; reconcile with the server",
+                        reason="missing_receipt",
+                    )
+                receipt = client.upload_status(row["upload_id"])
+                receipt_status = receipt["status"]
+                if receipt_status == COMPLETED:
+                    ledger.mark_completed(row["rel_path"], time.time())
+                elif receipt_status == FAILED:
+                    ledger.mark_failed(
+                        row["rel_path"],
+                        f"server: {receipt.get('error_message') or 'failed'}",
+                        cfg.max_attempts,
+                    )
+                if receipt_status in (COMPLETED, FAILED):
+                    row = ledger.get_doc(row["rel_path"])
+            except StatusPollError as exc:
+                poll_error = exc
+        code, reason = _verification_state(row["status"])
+        detail = row["last_error"]
+        if poll_error is not None:
+            code, reason = VERIFY_UNAVAILABLE, poll_error.reason
+            detail = str(poll_error)
+        elif receipt_status in ("PENDING", "PROCESSING"):
+            reason = f"receipt_{receipt_status.lower()}"
+        readiness = None
+        if cfg.readiness and code == VERIFY_COMPLETE:
+            try:
+                if not row["upload_id"]:
+                    raise StatusPollError(
+                        "Completed row has no receipt", reason="missing_receipt"
+                    )
+                readiness = client.readiness_status(row["upload_id"])
+                code = {
+                    "ready": VERIFY_COMPLETE,
+                    "outstanding": VERIFY_OUTSTANDING,
+                    "failed": VERIFY_FAILED,
+                    "unavailable": VERIFY_UNAVAILABLE,
+                }[readiness["state"]]
+                reason = f"readiness_{readiness['state']}"
+                detail = readiness.get("reasons", [])
+            except StatusPollError as exc:
+                poll_error = exc
+                code, reason, detail = VERIFY_UNAVAILABLE, exc.reason, str(exc)
+            readiness_code = max(readiness_code, code)
+        unavailable += int(code == VERIFY_UNAVAILABLE)
+        reasons[reason] += 1
+        record = {
+            "type": "document",
+            "schema_version": VERIFY_SCHEMA_VERSION,
+            "rel_path": row["rel_path"],
+            "status": row["status"],
+            "upload_id": row["upload_id"],
+            "receipt_status": receipt_status,
+            "reason": reason,
+            "detail": detail,
+            "http_status": poll_error.http_status if poll_error else None,
+        }
+        if cfg.readiness:
+            record["readiness"] = readiness
+        if cfg.json_output:
+            print(json.dumps(record, ensure_ascii=True))
+        elif code != VERIFY_COMPLETE:
+            print(f"{row['rel_path']!r}: {reason}" + (f" ({detail})" if detail else ""))
+
+    # Status counts are bounded by ledger states, not document count. A failed
+    # receipt remains a failure on the next pass even though it is no longer polled.
+    counts = ledger.status_counts()
+    code = max(
+        (_verification_state(status)[0] for status in counts),
+        default=VERIFY_COMPLETE,
     )
-    _print_status(ledger, client)
+    code = max(code, readiness_code)
+    if unavailable:
+        code = VERIFY_UNAVAILABLE
+    total = sum(counts.values())
+    outcome = {
+        VERIFY_COMPLETE: "complete" if total else "empty",
+        VERIFY_OUTSTANDING: "outstanding",
+        VERIFY_FAILED: "failed",
+        VERIFY_UNAVAILABLE: "unable_to_verify",
+    }[code]
+    summary = {
+        "type": "summary",
+        "schema_version": VERIFY_SCHEMA_VERSION,
+        "scope": "whole_ledger",
+        "completion_boundary": (
+            "search_readiness" if cfg.readiness else "worker_upload_transaction"
+        ),
+        "outcome": outcome,
+        "exit_code": code,
+        "total": total,
+        "counts": counts,
+        "reason_counts": dict(reasons),
+        "unavailable": unavailable,
+    }
+    if cfg.json_output:
+        print(json.dumps(summary, sort_keys=True))
+    else:
+        print(
+            f"verify: {outcome}; {counts.get(COMPLETED, 0)}/{total} worker uploads "
+            f"completed; unavailable={unavailable}; exit={code}"
+        )
+    return code
+
+
+def cmd_cleanup(cfg: Config) -> int:
+    from scripts.remote_ingest.checkpoints import Checkpoints
+
+    ledger = Ledger(cfg.ledger_path)
+    removed = 0
+    for row in ledger.all_docs(cfg.ledger_page_size):
+        removed += Checkpoints(cfg.ledger_path, row["rel_path"], create=False).prune()
+    logger.info(
+        "cleanup: removed %s unreferenced artifacts older than 24 hours", removed
+    )
     return 0
 
 
@@ -958,27 +1677,112 @@ def cmd_status(cfg: Config) -> int:
     client = None
     if cfg.target_url and cfg.worker_token:
         client = TargetClient(cfg)
-    _print_status(ledger, client)
+    return _print_status(ledger, client)
+
+
+def _run_preparations(cfg, parser):
+    from scripts.remote_ingest.checkpoints import fingerprint
+
+    local = parser.ensure_ready()
+    base = (
+        os.environ.get(
+            "EMBEDDINGS_MICROSERVICE_URL", "http://vector-embedder:8000"
+        ).rstrip("/")
+        if cfg.embeddings
+        else None
+    )
+    dimension = cfg.embedding_dimension if cfg.embeddings else None
+    return [
+        {
+            "fingerprint": fingerprint(
+                [
+                    identity,
+                    cfg.enricher_identity,
+                    cfg.embedding_identity,
+                    base,
+                    dimension,
+                ]
+            ),
+            "parser_name": identity["parser_name"],
+            "parser_version": identity["parser_version"],
+            "embedder_path": parser.default_embedder_path if cfg.embeddings else "",
+            "embedding_dimension": dimension or 0,
+            "embedding_model_fingerprint": fingerprint(cfg.embedding_identity),
+        }
+        for identity in local.identities.values()
+    ]
+
+
+def _validate_run_preparations(cfg, parser, policy):
+    expected = {entry["fingerprint"] for entry in policy["preparations"]}
+    actual = {entry["fingerprint"] for entry in _run_preparations(cfg, parser)}
+    if not actual.issubset(expected):
+        raise ValueError(
+            "Local preparation settings do not match the immutable run policy"
+        )
+
+
+def cmd_ingestion_run(cfg: Config, action: str) -> int:
+    ledger = Ledger(cfg.ledger_path)
+    stored_run = ledger.get_meta("ingestion_run_id")
+    if stored_run and cfg.ingestion_run_id and stored_run != cfg.ingestion_run_id:
+        raise ValueError(
+            "Ledger belongs to a different ingestion run; use its original run ID"
+        )
+    cfg.ingestion_run_id = cfg.ingestion_run_id or stored_run
+    if action == "create":
+        if cfg.run_ceiling_usd is None:
+            raise ValueError("run-create requires --run-budget-usd")
+        # Persist identity before POST so a lost response can be reconciled by
+        # run-status or by replaying creation with this same ID and policy.
+        cfg.ingestion_run_id = cfg.ingestion_run_id or str(uuid.uuid4())
+        ledger.set_meta("ingestion_run_id", cfg.ingestion_run_id)
+        parser = _Parser(cfg.parser_config, cfg.parser_identity)
+        payload = {
+            "id": cfg.ingestion_run_id,
+            "ceiling_usd": cfg.run_ceiling_usd,
+            "preparations": _run_preparations(cfg, parser),
+            "embedding_mode": cfg.run_embedding_mode,
+        }
+        report = TargetClient(cfg).ingestion_run_request(payload, create=True)
+    else:
+        if not cfg.ingestion_run_id:
+            raise ValueError("Supply --ingestion-run or use a ledger with a saved run")
+        client = TargetClient(cfg)
+        if action == "status":
+            report = client.ingestion_run_status(offset=cfg.run_offset)
+        else:
+            payload = {"action": action}
+            if cfg.run_ceiling_usd is not None:
+                payload["ceiling_usd"] = cfg.run_ceiling_usd
+            if cfg.run_operation_id:
+                payload["operation_id"] = cfg.run_operation_id
+            report = client.ingestion_run_request(payload)
+    print(json.dumps(report, indent=2))
     return 0
 
 
-def _print_status(ledger: Ledger, client: TargetClient | None) -> None:
+def _print_status(ledger: Ledger, client: TargetClient | None) -> int:
+    """Print an informational snapshot; return 2 for fatal status configuration."""
+    result = 0
     counts = ledger.status_counts()
     total = sum(counts.values())
     print("\n── Ledger ──")
     print(f"  root_dir : {ledger.get_meta('root_dir')}")
     print(f"  corpus   : {ledger.get_meta('corpus_id')}")
     print(f"  total    : {total}")
-    for st in (PENDING, UPLOADED, COMPLETED, FAILED, PARKED):
+    for st in (PENDING, UPLOADED, COMPLETED, FAILED, PARKED, AMBIGUOUS, CONFLICT):
         if counts.get(st):
             print(f"  {st:<9}: {counts[st]}")
     if client is not None:
         try:
-            print("\n── Target worker-upload backlog ──")
+            print("\n── Token-scoped outstanding uploads ──")
             print(f"  PENDING+PROCESSING : {client.backlog_count()}")
-        except Exception as e:  # noqa: BLE001
-            print(f"  (could not reach target: {e})")
+        except StatusPollError as exc:
+            result = 2 if exc.permanent else 0
+            print(f"  PENDING+PROCESSING : unknown ({exc})")
     print("")
+    return result
 
 
 # ======================================================================
@@ -1013,7 +1817,36 @@ def _build_config(args: argparse.Namespace) -> Config:
         verify_tls=not args.insecure,
         limit=args.limit,
         enrichers=enrichers,
+        parser_config=args.parser_config or os.environ.get("OC_PARSER_CONFIG"),
+        ledger_page_size=args.ledger_page_size,
+        enricher_identity=args.enricher_identity
+        or os.environ.get("OC_ENRICHER_IDENTITY"),
+        embedding_identity=args.embedding_identity
+        or os.environ.get("OC_EMBEDDING_IDENTITY"),
+        embedding_dimension=args.embedding_dimension,
+        parser_identity=args.parser_identity or os.environ.get("OC_PARSER_IDENTITY"),
+        json_output=args.json,
+        ingestion_run_id=args.ingestion_run or os.environ.get("OC_INGESTION_RUN"),
+        run_ceiling_usd=args.run_budget_usd,
+        run_embedding_mode=args.run_embedding_mode,
+        run_operation_id=args.run_operation,
+        run_offset=args.run_offset,
+        readiness=args.readiness,
     )
+
+
+def _nonnegative_int(value: str) -> int:
+    result = int(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return result
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1027,12 +1860,43 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target-url", help="Target OC base URL (env OC_TARGET_URL)")
     p.add_argument("--worker-token", help="WorkerKey token (env OC_WORKER_TOKEN)")
     p.add_argument("--corpus-id", help="Corpus id (informational; env OC_CORPUS_ID)")
-    p.add_argument("--root-dir", help="Root directory of PDFs (for plan/run)")
+    p.add_argument(
+        "--root-dir", help="Root directory of source documents (for plan/run)"
+    )
     p.add_argument("--extensions", help="Comma-separated extensions (default .pdf)")
-    p.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
+    p.add_argument(
+        "--parser-config",
+        help="Local parser mapping/settings JSON file (env OC_PARSER_CONFIG)",
+    )
+    p.add_argument(
+        "--parser-identity",
+        help="Parser deployment revision (env OC_PARSER_IDENTITY); per-parser JSON identities override this",
+    )
+    p.add_argument(
+        "--max-workers",
+        type=_positive_int,
+        default=DEFAULT_MAX_WORKERS,
+        help="Active workers; submitted unfinished work is capped at twice this value",
+    )
+    p.add_argument(
+        "--ledger-page-size",
+        type=_positive_int,
+        default=DEFAULT_LEDGER_PAGE_SIZE,
+        help="Maximum ledger rows fetched per page for run/verify (default 256)",
+    )
     p.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
-    p.add_argument("--queue-high", type=int, default=DEFAULT_QUEUE_HIGH)
-    p.add_argument("--queue-low", type=int, default=DEFAULT_QUEUE_LOW)
+    p.add_argument(
+        "--queue-high",
+        type=int,
+        default=DEFAULT_QUEUE_HIGH,
+        help="Pause run admission above this token-scoped outstanding upload count; <= 0 disables polling",
+    )
+    p.add_argument(
+        "--queue-low",
+        type=int,
+        default=DEFAULT_QUEUE_LOW,
+        help="Resume paused admission at/below this token-scoped count (0 <= low <= high when enabled)",
+    )
     p.add_argument(
         "--no-embeddings",
         action="store_true",
@@ -1064,8 +1928,70 @@ def main(argv: list[str] | None = None) -> int:
             "E.g. example_enrichers:effective_date_annotations"
         ),
     )
+    p.add_argument(
+        "--enricher-identity",
+        help=(
+            "Stable identity of effective enricher configuration/data "
+            "(required with enrichers; env OC_ENRICHER_IDENTITY)"
+        ),
+    )
+    p.add_argument(
+        "--embedding-identity",
+        help="Operator model/service revision (env OC_EMBEDDING_IDENTITY); bump when the model changes",
+    )
+    p.add_argument(
+        "--embedding-dimension",
+        type=_positive_int,
+        default=os.environ.get("OC_EMBEDDING_DIMENSION", "384"),
+        help="Expected document/annotation vector dimension (default 384)",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Stream verify document results and a final summary as JSON Lines",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
-    p.add_argument("command", choices=["plan", "run", "verify", "status"])
+    p.add_argument(
+        "--ingestion-run", help="Durable server run ID (also saved in the ledger)"
+    )
+    p.add_argument(
+        "--run-budget-usd",
+        help="Monetary ceiling for run-create or an audited increase on run-resume",
+    )
+    p.add_argument(
+        "--run-embedding-mode", choices=["prepared", "server"], default="prepared"
+    )
+    p.add_argument(
+        "--run-operation", help="Operation ID for run-retry or run-cancel-operation"
+    )
+    p.add_argument(
+        "--run-offset",
+        type=_nonnegative_int,
+        default=0,
+        help="Operation page offset for run-status",
+    )
+    p.add_argument(
+        "--readiness",
+        action="store_true",
+        help="Verify current server search readiness in addition to upload receipts",
+    )
+    p.add_argument(
+        "command",
+        choices=[
+            "plan",
+            "run",
+            "verify",
+            "status",
+            "cleanup",
+            "run-create",
+            "run-status",
+            "run-pause",
+            "run-resume",
+            "run-cancel",
+            "run-retry",
+            "run-cancel-operation",
+        ],
+    )
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -1073,9 +1999,19 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    if args.readiness and args.command != "verify":
+        p.error("--readiness is supported only by verify")
+    if args.json and args.command != "verify":
+        p.error("--json is supported only by verify")
     cfg = _build_config(args)
 
-    if args.command in ("run", "verify") and (
+    if args.command == "run":
+        try:
+            validate_watermarks(cfg.queue_high, cfg.queue_low)
+        except ValueError as exc:
+            p.error(str(exc))
+
+    if (args.command in ("run", "verify") or args.command.startswith("run-")) and (
         not cfg.target_url or not cfg.worker_token
     ):
         p.error(
@@ -1089,6 +2025,14 @@ def main(argv: list[str] | None = None) -> int:
         "run": cmd_run,
         "verify": cmd_verify,
         "status": cmd_status,
+        "cleanup": cmd_cleanup,
+        "run-create": lambda c: cmd_ingestion_run(c, "create"),
+        "run-status": lambda c: cmd_ingestion_run(c, "status"),
+        "run-pause": lambda c: cmd_ingestion_run(c, "pause"),
+        "run-resume": lambda c: cmd_ingestion_run(c, "resume"),
+        "run-cancel": lambda c: cmd_ingestion_run(c, "cancel"),
+        "run-retry": lambda c: cmd_ingestion_run(c, "retry_operation"),
+        "run-cancel-operation": lambda c: cmd_ingestion_run(c, "cancel_operation"),
     }[args.command](cfg)
 
 

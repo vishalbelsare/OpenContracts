@@ -92,6 +92,32 @@ class ResearchReportService(BaseService):
     # Kickoff
     # ------------------------------------------------------------------
     @classmethod
+    def require_scope(
+        cls, user: Any, corpus: Any, *, corpus_group: Any = None, request: Any = None
+    ) -> None:
+        """Require an active actor with access to the anchor corpus and group."""
+        if user is None or not user.is_active:
+            raise PermissionError("Research requester is inactive or missing")
+        error = cls.require_permission(
+            corpus, user, PermissionTypes.READ, request=request
+        )
+        if error:
+            raise PermissionError(error)
+
+        if corpus_group is not None:
+            from opencontractserver.corpuses.services import CorpusGroupService
+
+            visible = (
+                CorpusGroupService.list_visible_groups(user)
+                .filter(pk=corpus_group.pk)
+                .exists()
+            )
+            if not visible:
+                raise PermissionError(
+                    "Corpus group not found or not visible to this user."
+                )
+
+    @classmethod
     def start(
         cls,
         *,
@@ -114,30 +140,13 @@ class ResearchReportService(BaseService):
         is not.
 
         Raises:
-            PermissionError: when ``user`` lacks READ on ``corpus``, or the
-                requested group is not visible to them.
+            PermissionError: when ``user`` is inactive, lacks READ on ``corpus``,
+                or the requested group is not visible to them.
             ConcurrentResearchInProgress: when a non-terminal report for
                 the same ``(user, corpus)`` exists inside the configured
                 concurrency-guard window.
         """
-        error = cls.require_permission(
-            corpus, user, PermissionTypes.READ, request=request
-        )
-        if error:
-            raise PermissionError(error)
-
-        if corpus_group is not None:
-            from opencontractserver.corpuses.services import CorpusGroupService
-
-            visible = (
-                CorpusGroupService.list_visible_groups(user)
-                .filter(pk=corpus_group.pk)
-                .exists()
-            )
-            if not visible:
-                raise PermissionError(
-                    "Corpus group not found or not visible to this user."
-                )
+        cls.require_scope(user, corpus, corpus_group=corpus_group, request=request)
 
         default_max_steps: int = getattr(
             settings, "DEEP_RESEARCH_DEFAULT_MAX_STEPS", DEFAULT_MAX_STEPS_FALLBACK
@@ -706,6 +715,34 @@ class ResearchReportService(BaseService):
     # Finalize (terminal write from inside the loop)
     # ------------------------------------------------------------------
     @classmethod
+    def _readable_recovered_citations(
+        cls, report: ResearchReport, annotation_ids: list[int]
+    ) -> set[int]:
+        """Recheck saved citations through the same scope/visibility as retrieval."""
+        from opencontractserver.annotations.services import AnnotationService
+        from opencontractserver.corpuses.services import CorpusGroupService
+
+        if not annotation_ids:
+            return set()
+        corpus_ids = {report.corpus_id}
+        group = report.corpus_group
+        if group is not None:
+            corpus_ids.update(
+                CorpusGroupService.get_group_corpora_visible_to_user(
+                    report.creator, group
+                ).values_list("pk", flat=True)
+            )
+        return {
+            pk
+            for corpus_id in corpus_ids
+            for pk in AnnotationService.get_corpus_annotations(
+                corpus_id, report.creator
+            )
+            .filter(pk__in=annotation_ids)
+            .values_list("pk", flat=True)
+        }
+
+    @classmethod
     def finalize_once(
         cls,
         report: ResearchReport,
@@ -749,12 +786,22 @@ class ResearchReportService(BaseService):
             locked = ResearchReport.objects.select_for_update().get(pk=report.pk)
             if locked.is_terminal:
                 return False
+            # record_finding validates retrieval provenance before persisting.
+            # Read under the lock: another live worker may have saved findings
+            # since this worker started, and its accumulator is independent.
+            report.findings = locked.findings
+            recovered_annotation_ids = [
+                cid
+                for finding in locked.findings or []
+                for cid in finding.get("citations") or []
+            ]
             cls.finalize(
                 report,
                 executive_summary=executive_summary,
                 markdown_body=markdown_body,
                 retrieved_annotation_ids=retrieved_annotation_ids,
                 warnings=warnings,
+                recovered_annotation_ids=recovered_annotation_ids,
             )
         return True
 
@@ -767,6 +814,7 @@ class ResearchReportService(BaseService):
         markdown_body: str,
         retrieved_annotation_ids: list[int],
         warnings: list[str] | None = None,
+        recovered_annotation_ids: list[int] | None = None,
     ) -> None:
         """Render the final report and mark it COMPLETED.
 
@@ -800,10 +848,11 @@ class ResearchReportService(BaseService):
         ``retrieved_annotation_ids`` is the union of annotation IDs the
         retrieval tools surfaced during this run (the
         :attr:`PydanticAIDependencies.retrieved_annotation_ids` accumulator).
-        It is the sole gate on what may be cited: an id qualifies by coming
-        from a finding OR by appearing in the composed document, but either way
-        only if retrieval surfaced it. That is the closed citation graph, and it
-        is also what bounds the ``source_annotations`` M2M.
+        ``recovered_annotation_ids`` contains citations from persisted findings
+        read under ``finalize_once``'s row lock. ``record_finding`` checked their
+        retrieval provenance; we recheck their current visibility here. An id
+        must belong to one of these sets to enter the citation graph or the
+        ``source_annotations`` M2M.
         """
         from opencontractserver.annotations.models import Annotation
 
@@ -846,11 +895,13 @@ class ResearchReportService(BaseService):
         # anchor text and so cannot support anything.
         cited_ids |= _cited_ids_in(document)
 
-        # The closed citation graph is enforced HERE, and only here: whichever
-        # road an id took, it may be cited only if retrieval actually surfaced
-        # it this run. Every retrieval tool is permission-filtered, so this is
-        # also what keeps a citation inside what the run's creator may read.
-        cited_ids &= set(retrieved_annotation_ids)
+        # A resumed worker has a fresh in-memory retrieval accumulator. Saved
+        # findings retain provenance from earlier segments, but permissions
+        # may have changed: revalidate them at finalization, not worker startup.
+        recovered = cls._readable_recovered_citations(
+            report, recovered_annotation_ids or []
+        )
+        cited_ids &= set(retrieved_annotation_ids) | recovered
 
         # The evidence gate, second half. ``record_finding`` refuses a material
         # card with no citation at the door; this catches the card whose
@@ -875,8 +926,8 @@ class ResearchReportService(BaseService):
             update_warnings = list(warnings or [])
             update_warnings.append(
                 f"{len(blocked)} material obligation card(s) were withheld from "
-                "the report: their supporting annotations were not surfaced by "
-                "retrieval in this run, so nothing entails them."
+                "the report: their supporting annotations were not retrieved "
+                "during this research task or are no longer readable."
             )
             warnings = update_warnings
 
@@ -890,7 +941,7 @@ class ResearchReportService(BaseService):
         # a card does not serialise into one.
         full_content_parts: list[str] = []
         if any(f.get("card") for f in report.findings or []):
-            from graphql_relay import to_global_id
+            from opencontractserver.utils.ids import to_global_id
 
             full_content_parts.append(
                 "[component:research-findings reportId="

@@ -36,7 +36,6 @@ from django.db import models, transaction
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from filetype import filetype
-from graphql_relay import from_global_id
 
 from opencontractserver.constants.zip_import import (
     BULK_UPLOAD_OWNER_CACHE_PREFIX,
@@ -49,6 +48,9 @@ from opencontractserver.document_imports.models import (
     ChunkedUploadSession,
     ChunkedUploadStatus,
 )
+from opencontractserver.document_imports.serializers import (
+    CorpusExportImportOptionsSerializer,
+)
 from opencontractserver.documents.models import Document
 from opencontractserver.pipeline.registry import get_allowed_mime_types
 from opencontractserver.pipeline.utils import resolve_convertible_upload
@@ -59,7 +61,9 @@ from opencontractserver.tasks import (
     process_documents_zip,
 )
 from opencontractserver.types.enums import PermissionTypes
+from opencontractserver.users.services.automation_credentials import require_import
 from opencontractserver.utils.files import is_plaintext_content
+from opencontractserver.utils.ids import from_global_id
 from opencontractserver.utils.permissioning import set_permissions_for_obj_to_user
 
 if TYPE_CHECKING:
@@ -377,6 +381,11 @@ def import_document_for_user(
     ``error`` carries a user-safe message; the caller is responsible for
     mapping that to the appropriate transport response.
     """
+    require_import(
+        user,
+        "document",
+        {"add_to_corpus_id": add_to_corpus_id, "make_public": make_public},
+    )
     if (file_bytes is None) == (file_obj is None):
         raise ValueError(
             "import_document_for_user requires exactly one of file_bytes or file_obj"
@@ -530,6 +539,11 @@ def import_documents_zip_for_user(
 
     Returns :class:`ZipImportResult`. On failure, ``job_id`` is ``None``.
     """
+    require_import(
+        user,
+        "documents_zip",
+        {"add_to_corpus_id": add_to_corpus_id, "make_public": make_public},
+    )
     if user.is_usage_capped and not settings.USAGE_CAPPED_USER_CAN_IMPORT_CORPUS:
         raise DocumentImportPermissionError(
             DocumentImportPermissionError.BULK_UPLOAD_DENIED,
@@ -636,6 +650,9 @@ def import_zip_to_corpus_for_user(
     Returns :class:`ZipImportResult`. On failure, ``job_id`` is ``None``
     and ``error`` carries a user-safe message.
     """
+    require_import(
+        user, "zip_to_corpus", {"corpus_id": corpus_id, "make_public": make_public}
+    )
     if not _peek_zip_magic(zip_source):
         return ZipImportResult(
             job_id=None,
@@ -757,8 +774,8 @@ def import_corpus_export_for_user(
 
     ``reingest_and_remap`` defaults to ``True`` here — this is the opt-out
     boundary for the **user-facing** corpus-export import (the REST
-    ``CorpusExportImportView`` and the chunked-upload completion path both call
-    this without overriding it). Re-parsing each document through the current
+    ``CorpusExportImportView`` and the chunked-upload completion path both expose
+    this option). Re-parsing each document through the current
     pipeline and re-anchoring its non-structural annotations is the default
     behaviour for a user uploading an export; pass ``False`` to trust the
     export's baked PAWLs / structural layer instead. The lower-level
@@ -773,6 +790,7 @@ def import_corpus_export_for_user(
     :class:`DocumentImportPermissionError` so the caller can map it to a
     403 rather than a generic 400.
     """
+    require_import(user, "corpus_export", {"corpus_id": corpus_id})
     if user.is_usage_capped and not settings.USAGE_CAPPED_USER_CAN_IMPORT_CORPUS:
         raise DocumentImportPermissionError(
             DocumentImportPermissionError.BULK_UPLOAD_DENIED,
@@ -977,6 +995,13 @@ def _gate_chunked_corpus(corpus_ref, *, user, access_token) -> None:
         raise ChunkedUploadError(corpus_error, http_status=403)
 
 
+def _corpus_export_reingest_mode(metadata: dict) -> bool:
+    options = CorpusExportImportOptionsSerializer(data=metadata)
+    if not options.is_valid():
+        raise ChunkedUploadError("reingest_and_remap must be a boolean")
+    return options.validated_data["reingest_and_remap"]
+
+
 def start_chunked_upload(
     *,
     user,
@@ -1000,7 +1025,8 @@ def start_chunked_upload(
     Raises :class:`ChunkedUploadError` (client error, carries HTTP status)
     or :class:`DocumentImportPermissionError` (permission, 403).
     """
-    metadata = metadata or {}
+    metadata = dict(metadata or {})
+    require_import(user, kind, metadata)
 
     if kind not in ChunkedUploadKind.values:
         raise ChunkedUploadError(f"Unknown upload kind: {kind}")
@@ -1031,6 +1057,12 @@ def start_chunked_upload(
             "Worker tokens support only document and zip_to_corpus uploads",
             http_status=403,
         )
+
+    # Persist the token's implicit target now. Completion with another token
+    # must not retarget a DOCUMENT upload that omitted add_to_corpus_id.
+    if access_token is not None and kind == ChunkedUploadKind.DOCUMENT:
+        if normalise_optional(metadata.get("add_to_corpus_id")) is None:
+            metadata["add_to_corpus_id"] = str(access_token.corpus_id)
 
     # --- per-kind fast-fail permission gates (see _gate_chunked_corpus) ----------
     if kind == ChunkedUploadKind.DOCUMENT:
@@ -1068,6 +1100,7 @@ def start_chunked_upload(
                 access_token=access_token,
             )
         elif kind == ChunkedUploadKind.CORPUS_EXPORT:
+            metadata["reingest_and_remap"] = _corpus_export_reingest_mode(metadata)
             _gate_chunked_corpus(
                 normalise_optional(metadata.get("corpus_id")),
                 user=user,
@@ -1076,6 +1109,7 @@ def start_chunked_upload(
 
     session = ChunkedUploadSession.objects.create(
         creator=user,
+        automation_credential=getattr(user, "automation_credential", None),
         kind=kind,
         filename=filename or "upload",
         total_size=total_size,
@@ -1095,15 +1129,49 @@ def start_chunked_upload(
     return session
 
 
-def _get_owned_session(user, upload_id) -> ChunkedUploadSession:
+def _get_owned_session(user, upload_id, access_token=None) -> ChunkedUploadSession:
     """
     Fetch a session the requester owns, or raise a generic 404.
+
+    Automation scope denials raise DRF PermissionDenied (403) before upload
+    data is returned or changed; ownership/EDIT denials remain opaque 404s.
 
     Filtering by ``creator`` (rather than fetching then comparing) closes
     the IDOR: a cross-user id is indistinguishable from a missing one.
     """
     try:
-        return ChunkedUploadSession.objects.get(id=upload_id, creator=user)
+        session = ChunkedUploadSession.objects.get(id=upload_id, creator=user)
+        credential = getattr(user, "automation_credential", None)
+        if session.automation_credential_id != getattr(credential, "pk", None):
+            raise ChunkedUploadSession.DoesNotExist
+        require_import(user, session.kind, session.metadata or {})
+        if credential is not None:
+            # Recheck principal permissions before bytes, status, or completion.
+            target = (session.metadata or {}).get(
+                "corpus_id"
+                if session.kind in ("zip_to_corpus", "corpus_export")
+                else "add_to_corpus_id"
+            )
+            if normalise_optional(target) is not None:
+                corpus, _ = _resolve_corpus_for_edit(user, target)
+                if corpus is None:
+                    raise ChunkedUploadSession.DoesNotExist
+        if access_token is not None:
+            target_fields: dict[str, str] = {
+                ChunkedUploadKind.DOCUMENT: "add_to_corpus_id",
+                ChunkedUploadKind.ZIP_TO_CORPUS: "corpus_id",
+            }
+            target_field = target_fields.get(session.kind)
+            target = (
+                (session.metadata or {}).get(target_field) if target_field else None
+            )
+            # Legacy unbound worker sessions cannot be safely attributed to
+            # a corpus and must be restarted. Do not mutate them on denial.
+            if target is None or str(_resolve_pk(target)) != str(
+                access_token.corpus_id
+            ):
+                raise ChunkedUploadSession.DoesNotExist
+        return session
     except (ChunkedUploadSession.DoesNotExist, ValueError, TypeError):
         raise ChunkedUploadError("Upload session not found", http_status=404)
 
@@ -1114,6 +1182,7 @@ def store_chunk(
     upload_id,
     index: int,
     chunk_file: UploadedFile,
+    access_token: CorpusAccessToken | None = None,
 ) -> ChunkedSessionInfo:
     """
     Persist one part of a chunked upload (idempotent on ``index``).
@@ -1121,7 +1190,7 @@ def store_chunk(
     Re-uploading an index overwrites the previous part (deleting its
     storage object first) so a client can safely retry a failed part.
     """
-    session = _get_owned_session(user, upload_id)
+    session = _get_owned_session(user, upload_id, access_token)
     if session.status != ChunkedUploadStatus.PENDING:
         raise ChunkedUploadError(
             "Upload session is not accepting parts", http_status=409
@@ -1167,9 +1236,11 @@ def store_chunk(
     return _session_info(locked)
 
 
-def get_chunked_session_status(*, user, upload_id) -> ChunkedSessionInfo:
+def get_chunked_session_status(
+    *, user, upload_id, access_token: CorpusAccessToken | None = None
+) -> ChunkedSessionInfo:
     """Return progress for a session the requester owns (resumability)."""
-    return _session_info(_get_owned_session(user, upload_id))
+    return _session_info(_get_owned_session(user, upload_id, access_token))
 
 
 def _safe_unlink(path: str) -> None:
@@ -1251,12 +1322,18 @@ def complete_chunked_upload(
     :class:`DocumentImportPermissionError` (propagated from the import
     service).
     """
-    session = _get_owned_session(user, upload_id)
+    session = _get_owned_session(user, upload_id, access_token)
     if session.status != ChunkedUploadStatus.PENDING:
         raise ChunkedUploadError(
             f"Upload session is not completable (status={session.status})",
             http_status=409,
         )
+
+    # Validate old sessions before claiming them or assembling their bytes.
+    # They may contain options saved before start-time normalization existed.
+    reingest_and_remap = True
+    if session.kind == ChunkedUploadKind.CORPUS_EXPORT:
+        reingest_and_remap = _corpus_export_reingest_mode(session.metadata or {})
 
     # Integrity: every part present exactly once, and the bytes add up.
     parts = list(session.parts.order_by("index"))
@@ -1362,6 +1439,7 @@ def complete_chunked_upload(
                 user=user,
                 zip_source=File(tmp, name=session.filename),
                 corpus_id=normalise_optional(md.get("corpus_id")),
+                reingest_and_remap=reingest_and_remap,
             )
     except DocumentImportPermissionError:
         _mark_failed(session, "Permission denied")

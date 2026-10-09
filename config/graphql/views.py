@@ -22,6 +22,7 @@ from typing import Any
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import AnonymousUser
 from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.utils.cache import add_never_cache_headers
 from strawberry.django.views import GraphQLView as _StrawberryGraphQLView
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,14 @@ def authenticate_request(request: HttpRequest) -> None:
     session-authenticated users untouched. Token errors (expired/invalid
     signature) propagate to the caller for GraphQL-error formatting.
     """
+    # An explicit automation credential must never inherit a browser session's
+    # broader permissions (or bypass revocation through its session cookie).
+    from config.automation_auth import AutomationAuthentication
+
+    automation = AutomationAuthentication().authenticate(request)
+    if automation is not None:
+        request.user = automation[0]
+        return
     has_user = hasattr(request, "user")
     if has_user and request.user.is_authenticated:
         return
@@ -59,7 +68,10 @@ class GraphQLView(_StrawberryGraphQLView):
 
     def dispatch(self, request: HttpRequest, *args: Any, **kwargs: Any):
         try:
-            return super().dispatch(request, *args, **kwargs)
+            response = super().dispatch(request, *args, **kwargs)
+            if getattr(request, "automation_credential_management", False):
+                add_never_cache_headers(response)
+            return response
         except Exception as exc:  # noqa: BLE001
             # Auth-level failures raised during get_context surface as a
             # GraphQL-style error payload, like the graphene middlewares
@@ -72,8 +84,9 @@ class GraphQLView(_StrawberryGraphQLView):
             # malformed/unknown/inactive API keys (DRF ``AuthenticationFailed``
             # raised by ``ApiKeyBackend`` when ``USE_API_KEY_AUTH=True``) both
             # become a 200 error payload rather than an unhandled 500.
-            from graphql_jwt.exceptions import JSONWebTokenError
             from rest_framework.exceptions import AuthenticationFailed
+
+            from config.jwt_auth.exceptions import JSONWebTokenError
 
             if isinstance(exc, (JSONWebTokenError, AuthenticationFailed)):
                 return JsonResponse(

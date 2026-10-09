@@ -13,7 +13,6 @@ Covers:
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
-from graphql_relay import to_global_id
 from rest_framework.test import APIClient
 
 from config.graphql.schema import schema
@@ -22,6 +21,7 @@ from opencontractserver.analyzer.models import Analysis, Analyzer, GremlinEngine
 from opencontractserver.corpuses.models import Corpus
 from opencontractserver.documents.models import Document
 from opencontractserver.types.enums import PermissionTypes
+from opencontractserver.utils.ids import to_global_id
 from opencontractserver.utils.permissioning import set_permissions_for_obj_to_user
 
 User = get_user_model()
@@ -1199,6 +1199,40 @@ class TestDepthLimitValidationRule(TestCase):
     does not pass validation_rules (those are applied by GraphQLView in urls.py).
     """
 
+    def test_fragment_dag_is_measured_without_exponential_expansion(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from graphql import parse
+
+        from config.graphql.security import _measure_depth
+
+        definitions = ["query { ...F0 }"]
+        for index in range(20):
+            nested = f"...F{index + 1} ...F{index + 1}" if index < 19 else "rawText"
+            definitions.append(
+                f"fragment F{index} on AnnotationType {{ parent {{ {nested} }} }}"
+            )
+        document = parse("\n".join(definitions))
+        fragments = {node.name.value: node for node in document.definitions[1:]}
+        context = SimpleNamespace(get_fragment=Mock(side_effect=fragments.get))
+        self.assertEqual(_measure_depth(document.definitions[0], context=context), 21)
+        self.assertEqual(context.get_fragment.call_count, 20)
+
+    def test_reused_fragment_is_counted_at_each_depth(self):
+        query = """
+            query {
+                annotation(id: "unused") {
+                    ...Leaf
+                    parent { parent { ...Leaf } }
+                }
+            }
+            fragment Leaf on AnnotationType { parent { rawText } }
+        """
+        errors = self._validate_query(query, max_depth=4)
+        self.assertTrue(any("depth" in str(error).lower() for error in errors))
+        self.assertFalse(self._validate_query(query, max_depth=5))
+
     def _validate_query(self, query_str, max_depth):
         """Validate a query against the real schema with a given depth limit."""
         from graphql import parse, validate
@@ -1211,9 +1245,7 @@ class TestDepthLimitValidationRule(TestCase):
             document = parse(query_str)
             from config.graphql.security import DepthLimitValidationRule
 
-            errors = validate(
-                schema.graphql_schema, document, [DepthLimitValidationRule]
-            )
+            errors = validate(schema._schema, document, [DepthLimitValidationRule])
             return errors
         finally:
             security_module.GRAPHQL_MAX_QUERY_DEPTH = original_depth
@@ -1974,11 +2006,10 @@ class TestIOSettingsRequiredFieldsGuard(TestCase):
         ``graphene_model.__class__.__name__`` (the metaclass name like
         ``"SubclassWithMeta_Meta"``).
         """
-        from graphql_relay import from_global_id
-
         from config.graphql.schema import schema
         from config.graphql.testing import Client
         from opencontractserver.corpuses.models import Corpus
+        from opencontractserver.utils.ids import from_global_id
 
         user = User.objects.create_user(username="objIdRegressionUser", password="x")
 
@@ -2026,7 +2057,7 @@ class TestServedValidationRulesIncludeSpecRules(TestCase):
         document = parse(
             'query { analyses(bogusArgument: "x") { edges { node { id } } } }'
         )
-        errors = validate(schema.graphql_schema, document, validation_rules)
+        errors = validate(schema._schema, document, validation_rules)
         self.assertTrue(
             any("Unknown argument" in str(e) for e in errors),
             f"spec validation is OFF on the served endpoint: {errors!r}",
@@ -2038,7 +2069,7 @@ class TestServedValidationRulesIncludeSpecRules(TestCase):
         from config.graphql.schema import schema, validation_rules
 
         document = parse("query { definitelyNotARealField }")
-        errors = validate(schema.graphql_schema, document, validation_rules)
+        errors = validate(schema._schema, document, validation_rules)
         self.assertTrue(errors)
 
     def test_depth_limit_still_enforced_alongside_spec_rules(self):
@@ -2051,7 +2082,7 @@ class TestServedValidationRulesIncludeSpecRules(TestCase):
         for _ in range(20):
             inner = f"parent {{ {inner} }}"
         document = parse(f"query {{ corpuses {{ edges {{ node {{ {inner} }} }} }} }}")
-        errors = validate(schema.graphql_schema, document, validation_rules)
+        errors = validate(schema._schema, document, validation_rules)
         self.assertTrue(any("depth" in str(e).lower() for e in errors))
 
 

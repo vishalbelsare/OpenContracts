@@ -1,12 +1,10 @@
 import logging
 
-import graphql_jwt
-from django.contrib.auth import get_user_model
-from graphql_jwt.exceptions import JSONWebTokenExpired
-
 from config.graphql_auth0_auth.utils import get_user_by_token
+from config.jwt_auth import utils as jwt_utils
+from config.jwt_auth.exceptions import JSONWebTokenExpired
+from config.jwt_auth.shortcuts import get_active_user
 
-UserModel = get_user_model()
 logger = logging.getLogger(__name__)
 
 
@@ -24,17 +22,15 @@ class Auth0RemoteUserJSONWebTokenBackend:
     - This allows the frontend to distinguish between "token expired" (refresh needed)
       vs "token invalid" (re-authentication needed)
 
-    Important: This backend is only called in JWT validation contexts (GraphQL requests
-    with Authorization headers), NOT by Django's standard AuthenticationMiddleware
-    which reads users from sessions.
+    ``authenticate`` validates header credentials on GraphQL requests and never
+    creates a Django session. ``get_user`` exists for completeness: no production
+    login flow tags a session with this backend today, but if one ever does, it
+    reloads only active accounts so deactivation takes effect on the next request.
     """
 
     def authenticate(self, request=None, **kwargs):
         logger.debug(
             f"Auth0RemoteUserJSONWebTokenBackend.authenticate() - Starting with request: {request}"
-        )
-        logger.debug(
-            f"Auth0RemoteUserJSONWebTokenBackend.authenticate() - kwargs: {kwargs}"
         )
 
         if request is None or getattr(request, "_jwt_token_auth", False):
@@ -43,14 +39,10 @@ class Auth0RemoteUserJSONWebTokenBackend:
             )
             return None
 
-        token = graphql_jwt.utils.get_credentials(request, **kwargs)
+        token = jwt_utils.get_credentials(request, **kwargs)
         logger.debug(
             f"Auth0RemoteUserJSONWebTokenBackend.authenticate() - token retrieved: {'Present' if token else 'None'}"
         )
-        if token:
-            logger.debug(
-                f"Auth0RemoteUserJSONWebTokenBackend.authenticate() - token first 10 chars: {token[:10]}"
-            )
 
         if token is not None:
             try:
@@ -84,18 +76,18 @@ class Auth0RemoteUserJSONWebTokenBackend:
             f"Auth0RemoteUserJSONWebTokenBackend.get_user() - Looking up user_id: {user_id}"
         )
         try:
-            user = UserModel._default_manager.get(pk=user_id)
-            logger.debug(
-                f"Auth0RemoteUserJSONWebTokenBackend.get_user() - Found user: {user}, is_active: {user.is_active}"
-            )
-            return user
-        except UserModel.DoesNotExist:
-            logger.warning(
-                f"Auth0RemoteUserJSONWebTokenBackend.get_user() - User with id {user_id} does not exist"
-            )
-            return None
+            user = get_active_user(user_id)
         except Exception as e:
             logger.error(
                 f"Auth0RemoteUserJSONWebTokenBackend.get_user() - Error getting user: {str(e)}"
             )
             return None
+        if user is None:
+            logger.warning(
+                f"Auth0RemoteUserJSONWebTokenBackend.get_user() - No active user with id {user_id}"
+            )
+        else:
+            logger.debug(
+                f"Auth0RemoteUserJSONWebTokenBackend.get_user() - Found user: {user}"
+            )
+        return user

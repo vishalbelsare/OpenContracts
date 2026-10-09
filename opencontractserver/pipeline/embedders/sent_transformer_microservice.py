@@ -1,9 +1,9 @@
 import logging
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -12,6 +12,11 @@ from opencontractserver.constants.document_processing import (
     EMBEDDER_BATCH_REQUEST_TIMEOUT_SECONDS,
     EMBEDDER_SINGLE_REQUEST_TIMEOUT_SECONDS,
     MICROSERVICE_EMBEDDER_MAX_BATCH_SIZE,
+    OPENAI_EMBEDDER_MAX_INPUT_CHARS,
+)
+from opencontractserver.constants.embeddings import (
+    MICROSERVICE_ACCOUNTED_EMBEDDING_VERSION,
+    MICROSERVICE_MODEL_REVISION_PATTERN,
 )
 from opencontractserver.pipeline.base.embedder import BaseEmbedder
 from opencontractserver.pipeline.base.exceptions import (
@@ -24,6 +29,11 @@ from opencontractserver.pipeline.base.settings_schema import (
     SettingType,
 )
 from opencontractserver.utils.cloud import maybe_add_cloud_run_auth
+from opencontractserver.utils.embedding_validation import (
+    embedding_batch,
+    embedding_values,
+    normalize_embedding_vector,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -112,6 +122,7 @@ class MicroserviceEmbedder(BaseEmbedder):
     description = "Generates embeddings using a vector embeddings microservice."
     author = "OpenContracts Team"
     dependencies = ["numpy", "requests"]
+    accounting_version = MICROSERVICE_ACCOUNTED_EMBEDDING_VERSION
     vector_size = 384  # Default embedding size
     supported_file_types = [
         FileTypeEnum.PDF,
@@ -148,6 +159,20 @@ class MicroserviceEmbedder(BaseEmbedder):
                 )
             },
         )
+        embeddings_microservice_url_bulk: str = field(
+            default="",
+            metadata={
+                "pipeline_setting": PipelineSetting(
+                    setting_type=SettingType.OPTIONAL,
+                    required=False,
+                    description=(
+                        "Optional pool for ingest embedding (same model); search "
+                        "queries stay on embeddings_microservice_url."
+                    ),
+                    env_var="EMBEDDINGS_MICROSERVICE_URL_BULK",
+                )
+            },
+        )
         vector_embedder_api_key: str = field(
             default="",
             metadata={
@@ -165,6 +190,37 @@ class MicroserviceEmbedder(BaseEmbedder):
                 "pipeline_setting": PipelineSetting(
                     setting_type=SettingType.OPTIONAL,
                     description="Force Google Cloud Run IAM authentication",
+                )
+            },
+        )
+        embedding_model_revision: str = field(
+            default="",
+            metadata={
+                "pipeline_setting": PipelineSetting(
+                    setting_type=SettingType.OPTIONAL,
+                    description=(
+                        "Deployed model and immutable revision (model@revision). "
+                        "Required for policy-bound ingestion; update when the model changes."
+                    ),
+                    validation=lambda value: isinstance(value, str)
+                    and (
+                        not value
+                        or re.fullmatch(MICROSERVICE_MODEL_REVISION_PATTERN, value)
+                        is not None
+                    ),
+                )
+            },
+        )
+        no_external_provider_fees: bool = field(
+            default=False,
+            metadata={
+                "pipeline_setting": PipelineSetting(
+                    setting_type=SettingType.OPTIONAL,
+                    description=(
+                        "Operator confirms this self-hosted service has no external "
+                        "provider fees. Infrastructure costs are excluded from run budgets."
+                    ),
+                    validation=lambda value: type(value) is bool,
                 )
             },
         )
@@ -194,6 +250,12 @@ class MicroserviceEmbedder(BaseEmbedder):
         service_url = all_kwargs.get(
             "embeddings_microservice_url", s.embeddings_microservice_url
         )
+        # Ingest tags calls ``use_bulk_pool=True``; queries never do.
+        bulk_url = all_kwargs.get(
+            "embeddings_microservice_url_bulk", s.embeddings_microservice_url_bulk
+        )
+        if all_kwargs.get("use_bulk_pool") and bulk_url:
+            service_url = bulk_url
         api_key = all_kwargs.get("vector_embedder_api_key", s.vector_embedder_api_key)
         use_cloud_run_iam_auth = bool(
             all_kwargs.get("use_cloud_run_iam_auth", s.use_cloud_run_iam_auth)
@@ -208,6 +270,30 @@ class MicroserviceEmbedder(BaseEmbedder):
         )
 
         return service_url, headers
+
+    def embed_text_accounted(self, text: str) -> tuple[list[float], int]:
+        """One bounded request for an explicitly approved self-hosted run.
+
+        Zero denotes billable provider tokens, not measured inference usage.
+        Infrastructure is outside the run budget. The run owns every retry;
+        neither the ordinary retrying session nor redirects may repeat a POST.
+        """
+        service_url, headers = self._get_service_config(self.get_component_settings())
+        with requests.Session() as session:
+            session.mount("http://", HTTPAdapter(max_retries=0))
+            session.mount("https://", HTTPAdapter(max_retries=0))
+            response = session.post(
+                f"{service_url.rstrip('/')}/embeddings",
+                json={"text": text[:OPENAI_EMBEDDER_MAX_INPUT_CHARS]},
+                headers=headers,
+                timeout=EMBEDDER_SINGLE_REQUEST_TIMEOUT_SECONDS,
+                allow_redirects=False,
+            )
+            if response.status_code != 200:
+                # Never expose a provider response, endpoint or credential.
+                raise ValueError("embedding_request_failed")
+            vector = normalize_embedding_vector(embedding_values(response.json()))
+        return vector, 0
 
     def _embed_text_impl(self, text: str, **all_kwargs) -> Optional[list[float]]:
         """
@@ -234,24 +320,7 @@ class MicroserviceEmbedder(BaseEmbedder):
             )
 
             if response.status_code == 200:
-                body = response.json()
-                if "embeddings" not in body:
-                    logger.error(
-                        f"Malformed 200 response: missing 'embeddings' key. "
-                        f"Keys received: {list(body.keys())}"
-                    )
-                    return None
-                embeddings_array = np.array(body["embeddings"])
-                if np.isnan(embeddings_array).any():
-                    logger.error("Embedding contains NaN values")
-                    return None
-                # Handle both 1D (single embedding) and 2D (batch) response formats
-                if embeddings_array.ndim == 1:
-                    # Service returns 1D array directly: [0.1, 0.2, ...]
-                    return embeddings_array.tolist()
-                else:
-                    # Service returns 2D batch array: [[0.1, 0.2, ...]]
-                    return embeddings_array[0].tolist()
+                return normalize_embedding_vector(embedding_values(response.json()))
             elif 400 <= response.status_code < 500:
                 # Client errors (4xx) - don't retry, likely invalid input
                 logger.error(
@@ -326,38 +395,15 @@ class MicroserviceEmbedder(BaseEmbedder):
             )
 
             if response.status_code == 200:
-                body = response.json()
-                if "embeddings" not in body:
-                    logger.error(
-                        f"Malformed 200 response: missing 'embeddings' key. "
-                        f"Keys received: {list(body.keys())}"
-                    )
-                    return None
-                embeddings_array = np.array(body["embeddings"])
-                if embeddings_array.ndim == 3:
-                    if embeddings_array.shape[1] != 1:
-                        logger.error(f"Unexpected 3D shape {embeddings_array.shape}")
-                        return None
-                    embeddings_array = embeddings_array.squeeze(axis=1)
-
-                if len(embeddings_array) != len(texts):
-                    logger.error(
-                        f"Vector count mismatch: sent {len(texts)} texts, "
-                        f"received {len(embeddings_array)} vectors"
-                    )
-                    return None
-
-                # Handle NaN values per-item rather than failing the whole batch
+                rows = embedding_batch(response.json(), len(texts))
+                # Preserve explicit per-item failures for _batch_embed_items.
                 results: list[Optional[list[float]]] = []
-                for i, row in enumerate(embeddings_array):
-                    if np.isnan(row).any():
-                        logger.error(
-                            f"Embedding at index {i} contains NaN values, "
-                            f"returning None for this item"
-                        )
+                for i, row in enumerate(rows):
+                    try:
+                        results.append(normalize_embedding_vector(row))
+                    except ValueError as exc:
+                        logger.error("Invalid embedding at index %s: %s", i, exc)
                         results.append(None)
-                    else:
-                        results.append(row.tolist())
                 return results
             elif 400 <= response.status_code < 500:
                 # Client errors (4xx) - not retriable, likely invalid input.

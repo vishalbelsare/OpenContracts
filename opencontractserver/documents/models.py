@@ -49,6 +49,14 @@ class Document(TreeNode, BaseOCModel, HasEmbeddingMixin):
 
     objects = DocumentManager()  # type: ignore[misc]
 
+    ingestion_run = models.ForeignKey(
+        "worker_uploads.IngestionRun",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="documents",
+    )
+
     # Key fields
     title = django.db.models.CharField(max_length=1024, null=True, blank=True)
     description = django.db.models.TextField(null=True, blank=True)
@@ -2213,6 +2221,33 @@ class PipelineSettings(django.db.models.Model):
 
 
 # -------------------- PendingDocumentAnnotations -------------------- #
+
+
+class EmbeddingRepair(django.db.models.Model):
+    """Latest bounded repair batch for a document, independent of parsing."""
+
+    document = django.db.models.OneToOneField(
+        Document, on_delete=django.db.models.CASCADE
+    )
+    requested_by = django.db.models.ForeignKey(
+        get_user_model(), on_delete=django.db.models.CASCADE
+    )
+    worker_token = django.db.models.ForeignKey(
+        "worker_uploads.CorpusAccessToken",
+        null=True,
+        on_delete=django.db.models.CASCADE,
+    )
+    corpus = django.db.models.ForeignKey(
+        "corpuses.Corpus", null=True, on_delete=django.db.models.CASCADE
+    )
+    generation = django.db.models.CharField(max_length=64)
+    status = django.db.models.CharField(max_length=16, default="queued")
+    requested = django.db.models.DateTimeField(default=timezone.now)
+    finished = django.db.models.DateTimeField(null=True)
+    attempted = django.db.models.PositiveIntegerField(default=0)
+    succeeded = django.db.models.PositiveIntegerField(default=0)
+    failed = django.db.models.PositiveIntegerField(default=0)
+    errors = django.db.models.JSONField(default=list)
 
 
 class PendingDocumentAnnotations(django.db.models.Model):

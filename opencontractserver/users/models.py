@@ -32,12 +32,40 @@ from opencontractserver.shared.slug_utils import (
     sanitize_slug,
     validate_user_slug_or_raise,
 )
+from opencontractserver.shared.user_can_mixin import PermissionStateMixin
 from opencontractserver.shared.utils import calc_oc_file_path
 from opencontractserver.types.enums import ExportType
 from opencontractserver.users.handle_generator import generate_handle
 from opencontractserver.users.validators import UserUnicodeUsernameValidator
 
 logger = logging.getLogger(__name__)
+
+
+class AutomationCredential(django.db.models.Model):
+    """A revocable capability ceiling on an existing user's permissions.
+
+    ``corpus_ids=None`` explicitly permits any corpus; an empty list permits
+    none. Secrets are random 256-bit values stored only as SHA-256 digests.
+    Rotation preserves the ID so in-progress uploads retain their owner.
+    """
+
+    id = django.db.models.UUIDField(
+        primary_key=True, default=uuid.uuid4, editable=False
+    )
+    user = django.db.models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=django.db.models.CASCADE
+    )
+    name = django.db.models.CharField(max_length=100)
+    secret_hash = django.db.models.CharField(max_length=64, editable=False)
+    scopes = django.db.models.JSONField(default=list)
+    corpus_ids = django.db.models.JSONField(default=list, null=True)
+    expires_at = django.db.models.DateTimeField(null=True, blank=True)
+    revoked_at = django.db.models.DateTimeField(null=True, blank=True)
+    created_at = django.db.models.DateTimeField(default=timezone.now, editable=False)
+    rotated_at = django.db.models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"AutomationCredential({self.pk}, actor={self.user_id})"
 
 
 class UserProfileManager(DjangoUserManager["User"]):
@@ -82,8 +110,11 @@ class UserProfileManager(DjangoUserManager["User"]):
         return self.filter(Q(id=user.pk) | Q(is_profile_public=True), is_active=True)
 
 
-class User(AbstractUser):
+class User(PermissionStateMixin, AbstractUser):
     """Default user for OpenContractServer."""
+
+    # Request-local capability context; never persisted or copied into tasks.
+    automation_credential: AutomationCredential | None = None
 
     # Class attribute — referenced by Django admin forms (UserChangeForm,
     # UserCreationForm) directly, separate from the field validators list.

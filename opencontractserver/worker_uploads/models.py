@@ -254,14 +254,14 @@ class CorpusAccessToken(models.Model):
         """
         Check if token is currently valid (active, not expired, account active).
 
-        Note: accesses self.worker_account.is_active. The auth backend
-        (WorkerTokenAuthentication) uses select_related("worker_account") so
+        Note: accesses worker_account and its linked user. The auth backend
+        (WorkerTokenAuthentication) uses select_related("worker_account__user") so
         this is already cached on the request path. If calling is_valid outside
         the auth flow, ensure worker_account is prefetched to avoid an extra query.
         """
         if not self.is_active:
             return False
-        if not self.worker_account.is_active:
+        if not self.worker_account.is_active or not self.worker_account.user.is_active:
             return False
         if self.expires_at and timezone.now() >= self.expires_at:
             return False
@@ -287,6 +287,13 @@ class WorkerDocumentUpload(models.Model):
     concurrent processing without conflicts.
     """
 
+    ingestion_run = models.ForeignKey(
+        "worker_uploads.IngestionRun",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="uploads",
+    )
     id = models.UUIDField(
         primary_key=True,
         default=uuid.uuid4,
@@ -299,6 +306,17 @@ class WorkerDocumentUpload(models.Model):
         related_name="uploads",
         help_text="Token used for this upload.",
     )
+    worker_account = models.ForeignKey(
+        WorkerAccount,
+        on_delete=models.CASCADE,
+        null=True,
+        help_text="Stable receipt owner across token rotation.",
+    )
+    client_key = models.CharField(max_length=128, null=True, blank=True)
+    payload_digest = models.CharField(max_length=64, blank=True, default="")
+    processing_token = models.UUIDField(null=True)
+    processing_attempts = models.PositiveIntegerField(default=0)
+    error_history = models.JSONField(default=list)
     corpus = models.ForeignKey(
         "corpuses.Corpus",
         on_delete=models.CASCADE,
@@ -338,6 +356,13 @@ class WorkerDocumentUpload(models.Model):
 
     class Meta:
         ordering = ["created"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["worker_account", "corpus", "client_key"],
+                condition=models.Q(client_key__isnull=False),
+                name="unique_worker_upload_client_key",
+            )
+        ]
         indexes = [
             models.Index(fields=["status", "created"]),
             models.Index(fields=["corpus", "status"]),
@@ -399,3 +424,11 @@ class WorkerAuthoritySectionBatch(models.Model):
 
     def __str__(self) -> str:
         return f"WorkerAuthoritySectionBatch({self.id}, {self.status})"
+
+
+from .run_models import (  # noqa: E402,F401
+    IngestionOperation,
+    IngestionReservation,
+    IngestionRun,
+    IngestionRunEvent,
+)

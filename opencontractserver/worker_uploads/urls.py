@@ -1,10 +1,16 @@
 from django.urls import path
 
+from opencontractserver.worker_uploads.run_views import (
+    IngestionRunCreateView,
+    IngestionRunView,
+)
 from opencontractserver.worker_uploads.views import (
     WorkerAuthoritySectionBatchListView,
     WorkerAuthoritySectionBatchStatusView,
     WorkerAuthoritySectionBatchView,
     WorkerDocumentUploadListView,
+    WorkerDocumentUploadLookupView,
+    WorkerDocumentUploadRetryView,
     WorkerDocumentUploadStatusView,
     WorkerDocumentUploadView,
 )
@@ -15,6 +21,18 @@ app_name = "worker_uploads"
 # because Django resolves URLs top-down and would otherwise try to parse
 # the literal string "list" as a UUID.
 urlpatterns = [
+    path("runs/", IngestionRunCreateView.as_view(), name="run-create"),
+    path("runs/<uuid:run_id>/", IngestionRunView.as_view(), name="run-detail"),
+    path(
+        "documents/by-key/<str:client_key>/",
+        WorkerDocumentUploadLookupView.as_view(),
+        name="lookup",
+    ),
+    path(
+        "documents/<uuid:upload_id>/retry/",
+        WorkerDocumentUploadRetryView.as_view(),
+        name="retry",
+    ),
     path(
         "documents/",
         WorkerDocumentUploadView.as_view(),

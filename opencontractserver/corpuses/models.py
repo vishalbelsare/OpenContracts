@@ -978,6 +978,7 @@ class Corpus(InstanceUserCanMixin, TreeNode):
                 original_file_type=document.original_file_type,
                 page_count=document.page_count,
                 custom_meta=document.custom_meta,  # Inherit custom metadata
+                ingestion_run_id=document.ingestion_run_id,
                 is_public=self.is_public
                 or document.is_public,  # Public corpus → public doc
                 version_tree_id=tree_id,  # NEW isolated version tree
@@ -994,8 +995,11 @@ class Corpus(InstanceUserCanMixin, TreeNode):
                 creator=user,  # type: ignore[misc]
                 # CRITICAL: Set processing_started to prevent ingest signal from firing
                 # Corpus copies share parsing artifacts - they don't need re-parsing
-                processing_started=timezone.now(),
-                backend_lock=False,  # Already processed, not locked
+                processing_started=document.processing_started or timezone.now(),
+                processing_finished=document.processing_finished,
+                processing_status=document.processing_status,
+                processing_error=document.processing_error,
+                backend_lock=False,  # Parsing artifacts are shared
                 **{
                     k: v
                     for k, v in doc_kwargs.items()
@@ -1006,6 +1010,8 @@ class Corpus(InstanceUserCanMixin, TreeNode):
                         "file_type",
                         "is_public",
                         "structural_annotation_set",
+                        "ingestion_run",
+                        "ingestion_run_id",
                     ]
                 },
             )

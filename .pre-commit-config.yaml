@@ -122,8 +122,7 @@ repos:
           - daphne==4.2.1
           - celery==5.6.3
           - pgvector==0.4.2
-          - strawberry-graphql==0.320.3
-          - django-graphql-jwt==0.4.0
+          - strawberry-graphql==0.323.2
           - pydantic==2.13.3
           - psycopg2-binary==2.9.11
           # --- Pulled in transitively by app admin autodiscover ---------
@@ -157,7 +156,12 @@ repos:
           - spacy
           - tokenizers>=0.21,<0.23
           - posthog==7.12.0
-          - mcp>=1.0.0
+          # Range matches requirements/base.txt's runtime pin exactly.
+          # opencontractserver/mcp/server.py targets the python-sdk 2.x
+          # API (on_*= handler kwargs, snake_case type fields); a hook env
+          # resolving a different major than the runtime turns main red
+          # with no commit touching mcp. Bump both pins together.
+          - mcp>=2.2.0,<3
           - argon2-cffi==25.1.0
           - cryptography==46.0.7
           - pyjwt==2.12.1

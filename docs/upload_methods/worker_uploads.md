@@ -6,6 +6,10 @@ already attached -- directly into a corpus. Unlike the other upload methods,
 worker uploads bypass OpenContracts' built-in parsing pipeline entirely because
 the documents have already been processed externally.
 
+Staged uploads and authority-section batches recheck the token, linked worker user,
+and corpus binding at drain time (`worker_uploads/tasks.py::_require_staged_worker_token`).
+Revocation stops work that has not started; it does not cancel an operation already running.
+
 ## When to Use Worker Uploads
 
 - **External processing pipelines** -- your organization has a custom NLP or
@@ -49,6 +53,16 @@ queue:
 | GET | `/api/worker-uploads/documents/list/` | List uploads for this token (paginated) |
 
 All endpoints require the `Authorization: WorkerKey <token>` header.
+
+Upload conflicts, ingestion-run policy failures, and readiness diagnostics expose
+allowlisted public codes via `utils/public_errors.py::PublicError.public_code`.
+Unrecognized domain exception messages become `upload_conflict`, `run_policy_error`,
+or `readiness_unavailable`; existing codes and HTTP statuses are preserved.
+Readiness responses use `document_processing_failed` for a nonempty
+`processing_error`, keeping saved parser exception details out of responses.
+Invalid authority-section specifications return HTTP 400 with
+`Invalid authority section specification.`; detailed validation exceptions are
+recorded only in server logs.
 
 ### Upload Request
 

@@ -25,6 +25,7 @@ from opencontractserver.pipeline.utils import (
 )
 from opencontractserver.shared.mixins import HasEmbeddingMixin
 from opencontractserver.types.enums import ContentModality
+from opencontractserver.utils.embedding_identity import embedding_configuration
 from opencontractserver.utils.embeddings import (
     RELATIONSHIP_SOURCE_TEXT_PREFETCH_ATTR,
     RELATIONSHIP_TARGET_TEXT_PREFETCH_ATTR,
@@ -58,8 +59,12 @@ def _create_text_embedding(
         obj_id: Object ID for logging
 
     Returns:
-        True if embedding was created successfully, False otherwise
+        True if a vector was created or run policy took ownership, False otherwise.
     """
+    from opencontractserver.worker_uploads.run_services import route_embedding
+
+    if route_embedding(obj):
+        return True
     if not text.strip():
         logger.info(f"{obj_type.capitalize()} {obj_id} has no text to embed.")
         return False
@@ -69,7 +74,8 @@ def _create_text_embedding(
         f"with embedder {embedder_path} (text length={len(text)})"
     )
 
-    vector = embedder.embed_text(text)
+    # Ingest is bulk work; see MicroserviceEmbedder._get_service_config.
+    vector = embedder.embed_text(text, use_bulk_pool=True)
 
     if vector is None:
         logger.error(
@@ -79,7 +85,9 @@ def _create_text_embedding(
         return False
 
     # Store the embedding - add_embedding handles duplicates via store_embedding
-    embedding = obj.add_embedding(embedder_path, vector)
+    embedding = obj.add_embedding(
+        embedder_path, vector, configuration=embedding_configuration(embedder)
+    )
 
     if embedding:
         logger.info(
@@ -108,8 +116,12 @@ def _create_embedding_for_annotation(
         embedder_path: Path identifier for the embedder
 
     Returns:
-        True if embedding was created successfully, False otherwise
+        True if a vector was created or run policy took ownership, False otherwise.
     """
+    from opencontractserver.worker_uploads.run_services import route_embedding
+
+    if route_embedding(annotation):
+        return True
     modalities = annotation.content_modalities or [ContentModality.TEXT.value]
     has_images = ContentModality.IMAGE.value in modalities
     can_embed_images = embedder.is_multimodal and embedder.supports_images
@@ -140,7 +152,9 @@ def _create_embedding_for_annotation(
             )
 
             # Store the embedding - add_embedding handles duplicates via store_embedding
-            embedding = annotation.add_embedding(embedder_path, vector)
+            embedding = annotation.add_embedding(
+                embedder_path, vector, configuration=embedding_configuration(embedder)
+            )
 
             if embedding:
                 logger.info(
@@ -218,8 +232,12 @@ def _apply_dual_embedding_strategy(
 
     Raises:
         EmbeddingGenerationError: If the default embedding fails (triggers Celery retry).
-            Corpus-specific embedding failures are logged but don't raise.
+        Corpus-specific embedding failures are logged but don't raise.
     """
+    from opencontractserver.worker_uploads.run_services import route_embedding
+
+    if route_embedding(obj, corpus_id):
+        return
     if not text.strip():
         logger.info(f"{obj_type.capitalize()} {obj_id} has no text to embed.")
         return
@@ -309,7 +327,10 @@ def _apply_dual_embedding_strategy(
     retry_kwargs={"max_retries": 3, "countdown": 60},
 )
 def calculate_embedding_for_doc_text(
-    self, doc_id: Union[str, int], corpus_id: Optional[Union[str, int]] = None
+    self,
+    doc_id: Union[str, int],
+    corpus_id: Optional[Union[str, int]] = None,
+    embedder_path: Optional[str] = None,
 ) -> None:
     """
     Calculate embeddings for the text extracted from a document.
@@ -327,6 +348,10 @@ def calculate_embedding_for_doc_text(
     """
     try:
         doc = Document.objects.get(id=doc_id)
+        from opencontractserver.worker_uploads.run_services import route_embedding
+
+        if route_embedding(doc, corpus_id):
+            return
 
         if doc.txt_extract_file.name:
             text = read_field_file_text(doc.txt_extract_file)
@@ -338,6 +363,12 @@ def calculate_embedding_for_doc_text(
             return _create_text_embedding(
                 obj, embedder, embedder_path, text, "document", doc.id
             )
+
+        if embedder_path:
+            embedder = get_component_by_name(embedder_path)()
+            if not doc_embed_func(doc, embedder, embedder_path):
+                raise EmbeddingGenerationError("Document embedding failed")
+            return
 
         _apply_dual_embedding_strategy(
             obj=doc,
@@ -399,6 +430,10 @@ def calculate_embedding_for_annotation_text(
         return
 
     # If explicit embedder_path is provided, use only that (bypass dual embedding)
+    from opencontractserver.worker_uploads.run_services import route_embedding
+
+    if route_embedding(annotation, corpus_id):
+        return
     if embedder_path:
         logger.info(
             f"Using explicit embedder_path {embedder_path} for annotation {annotation_id}"
@@ -547,9 +582,13 @@ def _batch_embed_items(
         - ``EmbeddingClientError`` and unexpected response/storage errors are
           recorded as permanent per-item failures.
     """
+    from opencontractserver.worker_uploads.run_services import route_embedding
+
+    items = [(obj, text) for obj, text in items if not route_embedding(obj)]
     if not items:
         return
 
+    configuration = embedding_configuration(embedder)
     # Carve into sub-batches up front so we can fan them out concurrently.
     chunks: list[list[tuple[Any, str]]] = [
         items[i : i + api_batch_size] for i in range(0, len(items), api_batch_size)
@@ -592,7 +631,7 @@ def _batch_embed_items(
 
     def _embed_one(chunk):
         texts_only = [text for _, text in chunk]
-        return chunk, embedder.embed_texts_batch(texts_only)
+        return chunk, embedder.embed_texts_batch(texts_only, use_bulk_pool=True)
 
     # Map future -> chunk index for logging/sub-batch numbering.
     #
@@ -691,7 +730,11 @@ def _batch_embed_items(
                     )
                     continue
                 try:
-                    embedding = obj.add_embedding(embedder_path, vector)
+                    embedding = obj.add_embedding(
+                        embedder_path,
+                        vector,
+                        configuration=configuration,
+                    )
                     if embedding:
                         result["succeeded"] += 1
                     else:
@@ -791,6 +834,11 @@ def calculate_embeddings_for_annotation_batch(
         "errors": [],
     }
 
+    from opencontractserver.worker_uploads.run_services import route_embedding_batch
+
+    annotation_ids = route_embedding_batch(
+        Annotation, annotation_ids, corpus_id, result
+    )
     if not annotation_ids:
         return result
 
@@ -1031,6 +1079,10 @@ def _embed_relationship(
     (default + corpus-preferred), which is wasted work when batches
     grow.
     """
+    from opencontractserver.worker_uploads.run_services import route_embedding
+
+    if route_embedding(relationship):
+        return True
     text = (
         precomputed_text
         if precomputed_text is not None
@@ -1050,7 +1102,7 @@ def _embed_relationship(
         embedder_path,
         len(text),
     )
-    vector = embedder.embed_text(text)
+    vector = embedder.embed_text(text, use_bulk_pool=True)
     if vector is None:
         logger.error(
             "Embedder %s returned None for relationship %s",
@@ -1059,7 +1111,9 @@ def _embed_relationship(
         )
         return False
 
-    embedding = relationship.add_embedding(embedder_path, vector)
+    embedding = relationship.add_embedding(
+        embedder_path, vector, configuration=embedding_configuration(embedder)
+    )
     if embedding is None:
         logger.error(
             "store_embedding returned None for relationship %s using %s",
@@ -1129,6 +1183,11 @@ def calculate_embeddings_for_relationship_batch(
         "errors": [],
     }
 
+    from opencontractserver.worker_uploads.run_services import route_embedding_batch
+
+    relationship_ids = route_embedding_batch(
+        Relationship, relationship_ids, corpus_id, result
+    )
     if not relationship_ids:
         return result
 

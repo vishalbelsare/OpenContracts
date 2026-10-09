@@ -14,7 +14,7 @@ Covers:
 import json
 from datetime import timedelta
 from io import BytesIO
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -31,6 +31,7 @@ from opencontractserver.annotations.models import (
     StructuralAnnotationSet,
 )
 from opencontractserver.corpuses.models import Corpus
+from opencontractserver.documents.models import Document, DocumentPath
 from opencontractserver.types.enums import PermissionTypes
 from opencontractserver.utils.permissioning import set_permissions_for_obj_to_user
 from opencontractserver.worker_uploads.auth import WORKER_AUTH_PREFIX
@@ -281,6 +282,14 @@ class TestWorkerTokenAuthentication(TestCase):
         response = client.get("/api/worker-uploads/documents/list/")
         self.assertEqual(response.status_code, 200)
 
+    def test_disabled_linked_user_rejects_worker_token(self):
+        self.account.user.is_active = False
+        self.account.user.save(update_fields=["is_active"])
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f"WorkerKey {self.plaintext_key}")
+        response = client.get("/api/worker-uploads/documents/list/")
+        self.assertEqual(response.status_code, 401)
+
     def test_missing_token(self):
         client = APIClient()
         response = client.get("/api/worker-uploads/documents/list/")
@@ -388,14 +397,15 @@ class TestWorkerUploadEndpoint(TestCase):
     )
     def test_upload_stages_document(self, mock_task):
         metadata = _make_metadata()
-        response = self.client.post(
-            "/api/worker-uploads/documents/",
-            {
-                "file": _make_fake_pdf_upload(),
-                "metadata": json.dumps(metadata),
-            },
-            format="multipart",
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                "/api/worker-uploads/documents/",
+                {
+                    "file": _make_fake_pdf_upload(),
+                    "metadata": json.dumps(metadata),
+                },
+                format="multipart",
+            )
         self.assertEqual(response.status_code, 202)
         data = response.json()
         self.assertEqual(data["status"], "PENDING")
@@ -407,7 +417,7 @@ class TestWorkerUploadEndpoint(TestCase):
         self.assertEqual(upload.status, UploadStatus.PENDING)
         self.assertEqual(upload.metadata["title"], "Test Document")
 
-        # Verify the task nudge was sent
+        # Verify the task nudge was sent after commit.
         mock_task.assert_called_once()
 
     @patch(
@@ -754,6 +764,48 @@ class TestBatchProcessor(TestCase):
             status=UploadStatus.PENDING,
         )
 
+    def test_drain_rechecks_credentials_and_scope_after_staging(self):
+        from opencontractserver.worker_uploads.tasks import process_pending_uploads
+
+        other = Corpus.objects.create(title="Other corpus", creator=self.admin)
+        for change in ("revoked", "expired", "account", "user", "corpus", "deleted"):
+            with self.subTest(change=change):
+                WorkerAccount.objects.filter(pk=self.account.pk).update(is_active=True)
+                User.objects.filter(pk=self.account.user_id).update(is_active=True)
+                self.token, _ = CorpusAccessToken.create_token(
+                    worker_account=self.account, corpus=self.corpus
+                )
+                upload = self._create_staged_upload()
+                staged_file = upload.file.name
+                if change == "account":
+                    WorkerAccount.objects.filter(pk=self.account.pk).update(
+                        is_active=False
+                    )
+                elif change == "user":
+                    User.objects.filter(pk=self.account.user_id).update(is_active=False)
+                elif change == "deleted":
+                    self.token.delete()
+                else:
+                    updates = {
+                        "revoked": {"is_active": False},
+                        "expired": {
+                            "expires_at": timezone.now() - timedelta(seconds=1)
+                        },
+                        "corpus": {"corpus": other},
+                    }
+                    CorpusAccessToken.objects.filter(pk=self.token.pk).update(
+                        **updates[change]
+                    )
+                models = (Document, DocumentPath, Annotation, Embedding)
+                before = [model.objects.count() for model in models]
+                result = process_pending_uploads.apply().get()
+                upload.refresh_from_db()
+                self.assertEqual(result["failed"], 1)
+                self.assertEqual(upload.status, UploadStatus.FAILED)
+                self.assertIn("token", upload.error_message.lower())
+                self.assertEqual([model.objects.count() for model in models], before)
+                self.assertFalse(upload.file.storage.exists(staged_file))
+
     def test_processes_pending_upload(self):
         """A PENDING upload is claimed and processed to COMPLETED."""
         from opencontractserver.worker_uploads.tasks import process_pending_uploads
@@ -770,6 +822,41 @@ class TestBatchProcessor(TestCase):
         self.assertEqual(upload.status, UploadStatus.COMPLETED)
         self.assertIsNotNone(upload.result_document)
         self.assertIsNotNone(upload.processing_finished)
+
+        corpus_doc = upload.result_document
+        source = corpus_doc.source_document
+        self.assertEqual(corpus_doc.processing_status, "completed")
+        self.assertEqual(source.processing_status, corpus_doc.processing_status)
+        self.assertEqual(source.processing_finished, corpus_doc.processing_finished)
+        self.assertIsNotNone(corpus_doc.processing_finished)
+
+    def test_unavailable_embedding_provenance_does_not_fail_the_upload_receipt(self):
+        from opencontractserver.documents.models import PipelineSettings
+        from opencontractserver.documents.readiness import assess_document
+        from opencontractserver.worker_uploads.tasks import process_pending_uploads
+
+        path = "opencontractserver.pipeline.embedders.test_embedder.TestEmbedder"
+        pipeline = PipelineSettings.get_instance(use_cache=False)
+        pipeline.default_embedder = path
+        pipeline.enabled_components = ["another.component"]
+        pipeline.save()
+        upload = self._create_staged_upload(
+            embeddings={
+                "embedder_path": path,
+                "model_identity": "deployed-v2",
+                "document_embedding": [0.1] * 384,
+            }
+        )
+        with override_settings(EMBEDDING_MODEL_REVISIONS={path: "deployed-v2"}):
+            result = process_pending_uploads.apply().get()
+            upload.refresh_from_db()
+            self.assertEqual(result["succeeded"], 1)
+            self.assertEqual(upload.status, UploadStatus.COMPLETED)
+            embedding = Embedding.objects.get(document=upload.result_document)
+            self.assertEqual(embedding.configuration, "")
+            readiness = assess_document(upload.result_document, self.corpus)
+            self.assertEqual(readiness["state"], "unavailable")
+            self.assertIn("embedder_unavailable", readiness["reasons"])
 
     def test_created_document_owned_by_corpus_creator(self):
         """Documents created by worker uploads are owned by the corpus creator."""
@@ -815,26 +902,12 @@ class TestBatchProcessor(TestCase):
         """Processing fails gracefully when corpus.creator is None."""
         from opencontractserver.worker_uploads.tasks import process_pending_uploads
 
-        # Force creator to None in the DB (bypassing NOT NULL for test purposes).
-        # Corpus.creator has null=False, but we test the defensive guard in
-        # _process_single_upload in case schema changes in the future.
         upload = self._create_staged_upload()
-
-        # Fetch the real upload BEFORE mocking select_related
-        real_upload = WorkerDocumentUpload.objects.select_related(
-            "corpus",
-            "corpus__creator",
-            "corpus_access_token",
-            "corpus_access_token__worker_account",
-        ).get(id=upload.id)
-        real_upload.corpus.creator = None
-
-        with patch(
-            "opencontractserver.worker_uploads.tasks.WorkerDocumentUpload"
-            ".objects.select_related"
-        ) as mock_qs:
-            mock_qs.return_value.get.return_value = real_upload
-
+        # The schema forbids NULL; substitute only the relation to exercise
+        # the defensive guard while retaining real receipt claims and writes.
+        with patch.object(
+            Corpus, "creator", new_callable=PropertyMock, return_value=None
+        ):
             result = process_pending_uploads.apply().get()
 
         self.assertEqual(result["failed"], 1)
@@ -984,21 +1057,8 @@ class TestBatchProcessor(TestCase):
 
         upload = self._create_staged_upload()
 
-        real_upload = WorkerDocumentUpload.objects.select_related(
-            "corpus",
-            "corpus__creator",
-            "corpus_access_token",
-            "corpus_access_token__worker_account",
-        ).get(id=upload.id)
-        real_upload.corpus.creator.is_active = False
-
-        with patch(
-            "opencontractserver.worker_uploads.tasks.WorkerDocumentUpload"
-            ".objects.select_related"
-        ) as mock_qs:
-            mock_qs.return_value.get.return_value = real_upload
-
-            result = process_pending_uploads.apply().get()
+        User.objects.filter(pk=self.admin.pk).update(is_active=False)
+        result = process_pending_uploads.apply().get()
 
         self.assertEqual(result["failed"], 1)
         upload.refresh_from_db()
@@ -1732,7 +1792,7 @@ class TestWorkerUploadFidelity(TestCase):
         # real PDF + thumbnailer that the fake test PDF can't satisfy).
         with patch(
             "opencontractserver.tasks.doc_tasks.extract_thumbnail.apply_async"
-        ) as mock_thumb:
+        ) as mock_thumb, self.captureOnCommitCallbacks(execute=True):
             process_pending_uploads.apply().get()
         upload.refresh_from_db()
         return upload, mock_thumb
@@ -1768,6 +1828,61 @@ class TestWorkerUploadFidelity(TestCase):
         child = on_set.get(raw_text="Body paragraph.")
         parent = on_set.get(raw_text="SECTION 1")
         self.assertEqual(child.parent_id, parent.id)
+
+    def test_span_mime_fallback_preserves_structural_tree_and_relationships(self):
+        from opencontractserver.annotations.models import Relationship
+        from opencontractserver.pipeline.base.file_types import FileTypeEnum
+        from opencontractserver.tests.test_remote_ingest_parsers import span_export
+
+        for mime in (FileTypeEnum.DOCX.mimetype, "text/plain", "application/txt"):
+            with self.subTest(mime=mime):
+                export = span_export()
+                metadata = {
+                    **export,
+                    "title": "Span document",
+                    "file_type": mime,
+                    # Omit annotation_type and label_type, as a normalized
+                    # Docxodus response can do. Both must use the MIME fallback.
+                    "text_labels": {
+                        "Heading": {"text": "Heading", "read_only": True},
+                        "Paragraph": {"text": "Paragraph", "read_only": True},
+                        "contains": {
+                            "text": "contains",
+                            "label_type": "RELATIONSHIP_LABEL",
+                        },
+                    },
+                    "parser_name": "Span parser",
+                    "parser_version": "1.0",
+                }
+                upload = self._stage(metadata)
+                with patch(
+                    "opencontractserver.tasks.embeddings_task.calculate_embeddings_for_annotation_batch.delay"
+                ):
+                    upload, _ = self._process(upload)
+                self.assertEqual(
+                    upload.status, UploadStatus.COMPLETED, upload.error_message
+                )
+                doc = upload.result_document
+                self.assertEqual(doc.file_type, mime)
+                with doc.txt_extract_file.open("r") as source:
+                    self.assertEqual(source.read(), export["content"])
+                structural_set = doc.structural_annotation_set
+                self.assertEqual(structural_set.parser_name, "Span parser")
+                annotations = Annotation.objects.filter(structural_set=structural_set)
+                self.assertEqual(annotations.count(), 2)
+                parent = annotations.get(raw_text="Heading")
+                child = annotations.get(raw_text="Body paragraph.")
+                self.assertEqual(child.parent_id, parent.pk)
+                for ann in annotations:
+                    self.assertEqual(ann.annotation_type, "SPAN_LABEL")
+                    self.assertEqual(ann.annotation_label.label_type, "SPAN_LABEL")
+                rel = Relationship.objects.get(
+                    relationship_label__text="contains", source_annotations=parent
+                )
+                self.assertEqual(
+                    list(rel.target_annotations.values_list("pk", flat=True)),
+                    [child.pk],
+                )
 
     def test_thumbnail_dispatched(self):
         upload = self._stage(_structural_metadata())

@@ -130,6 +130,9 @@ class WorkerDocumentUploadStatusSerializer(serializers.ModelSerializer):
     document_id = serializers.IntegerField(
         source="result_document_id", read_only=True, allow_null=True
     )
+    run_status = serializers.CharField(
+        source="ingestion_run.status", read_only=True, default=None
+    )
 
     class Meta:
         model = WorkerDocumentUpload
@@ -142,6 +145,12 @@ class WorkerDocumentUploadStatusSerializer(serializers.ModelSerializer):
             "created",
             "processing_started",
             "processing_finished",
+            "client_key",
+            "payload_digest",
+            "processing_attempts",
+            "error_history",
+            "ingestion_run",
+            "run_status",
         ]
         read_only_fields = fields
 
@@ -163,8 +172,11 @@ class WorkerAuthoritySectionBatchSerializer(serializers.Serializer):
 
         try:
             parse_section_spec({"sections": attrs["sections"]}, label="payload")
-        except ValueError as exc:
-            raise serializers.ValidationError(str(exc))
+        except ValueError:
+            logger.warning("Invalid authority section specification.", exc_info=True)
+            raise serializers.ValidationError(
+                "Invalid authority section specification."
+            ) from None
         for i, row in enumerate(attrs["equivalences"]):
             if not isinstance(row, dict):
                 raise serializers.ValidationError(

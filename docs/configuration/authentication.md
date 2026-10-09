@@ -144,8 +144,11 @@ This is used by the React frontend to authenticate users via PKCE.
     ```
 
 6. Scroll to **Refresh Token Rotation** and enable **Rotation**. This is required
-   because the frontend SDK uses `useRefreshTokens: true` to avoid cross-origin
-   iframe issues on localhost. Optionally enable **Refresh Token Expiration** for
+   because the frontend SDK uses `useRefreshTokens: true` for renewal during
+   the current page session. Tokens remain in memory; after reload, silent SSO
+   depends on browser cookie policy, with same-tab Login available if restoration
+   fails. See [frontend authentication flow](../frontend/auth_flow.md).
+   Optionally enable **Refresh Token Expiration** for
    additional security (recommended for production).
 7. Save changes
 
@@ -450,6 +453,24 @@ asynchronously within a few seconds of first login.
 ---
 
 ## Troubleshooting
+
+### Frontend login returns home without signing in or showing an error
+
+An existing Auth0 SSO session can skip the login form; that alone is normal.
+The application must still consume the callback and validate the token with
+the backend.
+
+If `?code=...&state=...` disappears without an Auth0 `/oauth/token` request,
+the frontend router may be rewriting the URL before the SDK initializes.
+`Auth0ProviderWithHistory` must delay mounting the application until SDK
+initialization and callback navigation finish. Rebuild and redeploy the frontend
+with that fix; changing cookie consent or the API audience does not fix this race.
+See the [callback regression procedure](../test_scripts/auth0-callback-routing.md).
+
+If the token exchange succeeds, inspect the subsequent GraphQL `GetMe` response.
+`me: null` means the backend did not accept the session; check Django's Auth0 logs
+and ensure its `AUTH0_DOMAIN` and `AUTH0_API_AUDIENCE` match the frontend's domain
+and audience. The API audience is an identifier and need not equal the API host.
 
 ### "Missing Refresh Token" error
 

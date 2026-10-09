@@ -36,7 +36,6 @@ import strawberry
 from django.contrib.auth import get_user_model
 from django.db.models import QuerySet
 from graphql import GraphQLError
-from graphql_relay import from_global_id
 
 from config.graphql import enums
 from config.graphql._util import coerce_enum, coerce_str, strip_unset
@@ -72,6 +71,7 @@ from opencontractserver.documents.models import (
     IngestionSource,
 )
 from opencontractserver.shared.services.base import BaseService
+from opencontractserver.utils.ids import from_global_id
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -594,9 +594,8 @@ def _resolve_DocumentType_version_history(root, info):
     attribute-based, so the same data is packed into the plain
     ``DocumentVersionType`` / ``VersionHistoryType`` value types instead.
     """
-    from graphql_relay import to_global_id
-
     from config.graphql.base_types import DocumentVersionType, VersionHistoryType
+    from opencontractserver.utils.ids import to_global_id
 
     # Get all documents in the version tree the user may see, ordered by
     # creation. Scoped to ``visible_to_user`` so this resolver cannot leak
@@ -658,9 +657,8 @@ def _resolve_DocumentType_path_history(root, info, corpus_id):
     attribute-based, so the same data is packed into the plain
     ``PathEventType`` / ``PathHistoryType`` value types instead.
     """
-    from graphql_relay import to_global_id
-
     from config.graphql.base_types import PathEventType, PathHistoryType
+    from opencontractserver.utils.ids import to_global_id
 
     _, corpus_pk = from_global_id(corpus_id)
 
@@ -739,9 +737,8 @@ def _resolve_DocumentType_corpus_versions(root, info, corpus_id):
     in one query reuses the same result for documents sharing a
     version_tree_id + corpus_id pair (avoids N+1).
     """
-    from graphql_relay import to_global_id
-
     from config.graphql.base_types import CorpusVersionInfoType
+    from opencontractserver.utils.ids import to_global_id
 
     type_name, corpus_pk = from_global_id(corpus_id)
     if not type_name or type_name != "CorpusType":
@@ -1434,9 +1431,11 @@ class DocumentType(Node):
         kwargs = strip_unset({"corpus_id": corpus_id})
         return _resolve_DocumentType_summary_revisions(self, info, **kwargs)
 
-    memory_for_corpus: None | (
-        Annotated[CorpusType, strawberry.lazy("config.graphql.corpus_types")]
-    ) = strawberry.field(name="memoryForCorpus", default=None)
+    @strawberry.field(name="memoryForCorpus")
+    def memory_for_corpus(
+        self, info: strawberry.Info
+    ) -> None | Annotated[CorpusType, strawberry.lazy("config.graphql.corpus_types")]:
+        return resolve_visible_fk(self, info, "memory_for_corpus_id", "CorpusType")
 
     @strawberry.field(
         name="corpusActionExecutions",
@@ -2787,12 +2786,19 @@ class DocumentAnalysisRowType(Node):
             node_type_name="DatacellType",
         )
 
-    analysis: None | (
-        Annotated[AnalysisType, strawberry.lazy("config.graphql.extract_types")]
-    ) = strawberry.field(name="analysis", default=None)
-    extract: None | (
-        Annotated[ExtractType, strawberry.lazy("config.graphql.extract_types")]
-    ) = strawberry.field(name="extract", default=None)
+    @strawberry.field(name="analysis")
+    def analysis(
+        self, info: strawberry.Info
+    ) -> (
+        None | Annotated[AnalysisType, strawberry.lazy("config.graphql.extract_types")]
+    ):
+        return resolve_visible_fk(self, info, "analysis_id", "AnalysisType")
+
+    @strawberry.field(name="extract")
+    def extract(
+        self, info: strawberry.Info
+    ) -> None | Annotated[ExtractType, strawberry.lazy("config.graphql.extract_types")]:
+        return resolve_visible_fk(self, info, "extract_id", "ExtractType")
 
     @strawberry.field(name="myPermissions")
     def my_permissions(self, info: strawberry.Info) -> GenericScalar | None:
@@ -2856,9 +2862,13 @@ class DocumentRelationshipType(Node):
             AnnotationLabelType, strawberry.lazy("config.graphql.annotation_types")
         ]
     ) = strawberry.field(name="annotationLabel", default=None)
-    corpus: None | (
-        Annotated[CorpusType, strawberry.lazy("config.graphql.corpus_types")]
-    ) = strawberry.field(name="corpus", default=None)
+
+    @strawberry.field(name="corpus")
+    def corpus(
+        self, info: strawberry.Info
+    ) -> None | Annotated[CorpusType, strawberry.lazy("config.graphql.corpus_types")]:
+        return resolve_visible_fk(self, info, "corpus_id", "CorpusType")
+
     data: GenericScalar | None = strawberry.field(name="data", default=None)
 
     @strawberry.field(name="myPermissions")
